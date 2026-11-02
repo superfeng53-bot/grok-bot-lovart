@@ -18,7 +18,7 @@ cd grok-bot-lovart
 |------|------|
 | `bin/` | 画布纯请求 Wan、选号、拷 Mac、防 cookie、画布 Chrome 助手 |
 | `lovart-auto/` | 每日积分到账程序化扫号（CDP + supercronic） |
-| `docs/` | 双扣根因备忘等 |
+| `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md` |
 | `examples/accounts.example.json` | CLI 账号占位示例（填自己的 ak/sk） |
 | `HANDOFF.md` | 本文件：积分核验与脚本索引（公开版） |
 
