@@ -1,0 +1,4 @@
+# Lovart 每日积分检查（Asia/Shanghai）。由 supercronic 执行，见 scheduler.sh
+0 9 * * * /workspace/lovart-auto/run.sh first
+0 10 * * * /workspace/lovart-auto/run.sh recheck
+0 11 * * * /workspace/lovart-auto/run.sh recheck

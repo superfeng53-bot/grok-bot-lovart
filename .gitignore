@@ -1,0 +1,14 @@
+# never commit secrets or runtime
+**/accounts.json
+**/lovart-sk-pairs.md
+**/lovart-lobot-ids.md
+**/*usertoken*
+**/chrome-profile/
+**/Cookies
+**/state/*.json
+**/wan-create-ledger.json
+lovart-auto/summary-*.json
+lovart-auto/logs/
+*.bak*
+.env
+.env.*

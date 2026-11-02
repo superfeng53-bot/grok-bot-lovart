@@ -1,0 +1,24 @@
+{
+  "active_index": 0,
+  "accounts": [
+    {
+      "id": "acc1",
+      "access_key": "ak_xxx",
+      "secret_key": "sk_xxx",
+      "status": "active",
+      "account_kind": "free",
+      "daily_budget": 100
+    },
+    {
+      "id": "acc2",
+      "access_key": "ak_yyy",
+      "secret_key": "sk_yyy",
+      "status": "active",
+      "account_kind": "recharge",
+      "daily_budget": 120,
+      "no_test": true,
+      "prefer_for": ["seedance", "video"],
+      "notes": "充值号：日限120；默认480p Seedance2.0；禁止测消耗"
+    }
+  ]
+}
