@@ -65,7 +65,7 @@ cd grok-bot-lovart
 
 ## 每日积分检查（`lovart-auto/`）
 
-- 入口：`run.sh first|recheck`；定时：`scheduler.sh` + `crontab`（上海 9/10/11 点）  
+- 入口：`run.sh first|recheck`；定时：`scheduler.sh` + `crontab`（上海 9/10/11 点，均 `timeout` 包裹：first 75m / recheck 40m）。单号 CDP 超时后须带超时收尸；禁止外层再 `flock`；`scheduler.sh restart` 可清「仍在跑」僵尸（2026-11-03）。  
 - 检查器：`check-one.cjs`；主程序：`lovart_auto.py`  
 - 摘要写 `summary-YYYY-MM-DD.json`；日报只报 L 编号，不写邮箱  
 - 导入方需自备 Chrome Profile 与 `lovart-daily-credits-state.json` 结构（本包不含真实 state）

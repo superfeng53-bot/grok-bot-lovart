@@ -92,11 +92,30 @@ def run_checker(email, today):
     try:
         out, err = p.communicate(timeout=CHECK_TIMEOUT)
     except subprocess.TimeoutExpired:
+        # 2026-11-03：超时后无时限 communicate() 曾永久挂死，导致 supercronic 把
+        # 同一条 cron 标成「仍在跑」跨天跳过 9/10/11 点轮次。kill 后必须再带超时收尸。
+        for sig in (signal.SIGKILL,):
+            try:
+                os.killpg(p.pid, sig)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate(timeout=15)
         except Exception:
-            pass
-        p.communicate()
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            try:
+                p.communicate(timeout=5)
+            except Exception:
+                pass
         return empty_raw(f"checker timeout {CHECK_TIMEOUT}s"), True
     lines = [l for l in (out or "").splitlines() if l.strip().startswith("{")]
     if not lines:

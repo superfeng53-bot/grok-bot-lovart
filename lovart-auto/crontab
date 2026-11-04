@@ -1,4 +1,5 @@
 # Lovart 每日积分检查（Asia/Shanghai）。由 supercronic 执行，见 scheduler.sh
-0 9 * * * /workspace/lovart-auto/run.sh first
-0 10 * * * /workspace/lovart-auto/run.sh recheck
-0 11 * * * /workspace/lovart-auto/run.sh recheck
+# timeout：防止单轮挂死让 supercronic 把同名任务标成「仍在跑」而跨天跳过（2026-11-03 修）
+0 9 * * * /usr/bin/timeout --kill-after=90s 75m /workspace/lovart-auto/run.sh first
+0 10 * * * /usr/bin/timeout --kill-after=60s 40m /workspace/lovart-auto/run.sh recheck
+0 11 * * * /usr/bin/timeout --kill-after=60s 40m /workspace/lovart-auto/run.sh recheck
