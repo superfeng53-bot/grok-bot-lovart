@@ -18,6 +18,8 @@ cd grok-bot-lovart
 |------|------|
 | `bin/` | 画布纯请求 Wan、选号、拷 Mac、防 cookie、画布 Chrome 助手 |
 | `lovart-auto/` | 每日积分到账程序化扫号（CDP + supercronic） |
+| `docs/SUBMIT-DEFAULTS.md` | **CLI/画布/出图提交默认参数**（fast、有声、480p…） |
+| `docs/skills/` | Seedance / 画布 Wan 技能摘录（去本机私有路径） |
 | `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md` |
 | `examples/accounts.example.json` | CLI 账号占位示例（填自己的 ak/sk） |
 | `HANDOFF.md` | 本文件：积分核验与脚本索引（公开版） |
@@ -85,3 +87,7 @@ Grok Bot「Lovart」分享模板只含技能与说明；**本仓库**提供可�
 ## 许可与免责
 
 脚本按现状提供，面向自行运营的 Lovart.ai 多账号工作流。公开仓不含密钥；泄露风险由导入方自控本地密钥文件。
+
+## 提交默认参数（Bot 最佳实践）
+
+第三方照抄发送参数见 [`docs/SUBMIT-DEFAULTS.md`](docs/SUBMIT-DEFAULTS.md)；技能摘录在 `docs/skills/`。
