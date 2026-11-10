@@ -18,6 +18,8 @@ cd grok-bot-lovart
 |------|------|
 | `bin/` | 画布纯请求 Wan、选号、拷 Mac、防 cookie、画布 Chrome 助手 |
 | `lovart-auto/` | 每日积分到账程序化扫号（CDP + supercronic；crontab 已 `timeout` 包裹，防任务挂死跨天跳过） |
+| `docs/SUBMIT-DEFAULTS.md` | **CLI/画布/出图提交默认参数**（fast、有声、480p…） |
+| `docs/skills/` | Seedance / 画布 Wan 技能摘录（去本机私有路径） |
 | `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md` |
 | `examples/accounts.example.json` | CLI 账号占位示例（填自己的 ak/sk） |
 | `HANDOFF.md` | 本文件：积分核验与脚本索引（公开版） |
