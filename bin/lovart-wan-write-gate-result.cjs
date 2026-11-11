@@ -68,15 +68,18 @@ const gate = `# CANVAS-GATE ${title}（纯请求优先）
 - intent: ${g('intent')}
 - project_id: ${g('project_id')}
 - duration: ${g('duration')}
+- mp4_duration: ${g('mp4_duration')}
 - balance_before: ${g('balance_before', g('balanceBefore'))}
 - price: ${g('price')}
 - balance_after: ${g('balance_after', g('balanceAfter'))}
 - generator_task_id: ${g('generator_task_id')}
 - download_path: ${g('download_path', g('box_path'))}
 - box_md5: ${g('box_md5', g('md5'))}
+- size: ${g('size')}
 - artifact_url: ${g('artifact_url')}
 - mac_path: ${g('mac_path', [g('mac_path_成品'), g('mac_path_项目')].filter(Boolean).join(' + '))}
-- mac_md5: ${g('mac_md5', g('box_md5', g('md5')))}
+- mac_md5: ${g('mac_md5')}
+- mac_copy_status: ${g('mac_copy_status')}
 - true_chips: ${g('true_chips', 'oud [@image:]×4 + [@audio:]×1')}
 - used_canvas: ${g('used_canvas', g('account'))}
 - note: ${g('note', '日配额已取消；只看积分核验（bal≥秒×4+2 且 price<bal）')}
@@ -100,9 +103,12 @@ const result = `# RESULT ${title}
 - box_path: ${g('download_path', g('box_path'))}
 - box_md5: ${g('box_md5', g('md5'))}
 - size: ${g('size')}
+- mp4_duration: ${g('mp4_duration')}
 - mac_成品: ${g('mac_path_成品', g('mac_成品'))}
 - mac_项目: ${g('mac_path_项目', g('mac_项目'))}
-- mac_md5_ok: ${g('mac_md5_ok', g('mac_md5') ? 'true' : '')}
+- mac_md5: ${g('mac_md5')}
+- mac_copy_status: ${g('mac_copy_status')}
+- mac_md5_ok: ${g('mac_md5_ok')}
 - used_canvas: ${g('used_canvas', g('account'))}
 - billable_creates: ${g('billable_creates', fields.dry_run ? '0' : '')}
 - stopped_short: ${g('stopped_short', '')}
