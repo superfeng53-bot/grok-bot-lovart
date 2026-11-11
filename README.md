@@ -16,9 +16,10 @@ cd grok-bot-lovart
 
 | 路径 | 用途 |
 |------|------|
-| `bin/` | 画布纯请求 Wan、选号、拷 Mac、防 cookie、画布 Chrome 助手 |
+| `bin/` | 画布 Wan 批量入口、纯请求、选号、拷 Mac、防 cookie、画布 Chrome |
 | `lovart-auto/` | 每日积分到账程序化扫号（CDP + supercronic；crontab 已 `timeout` 包裹，防任务挂死跨天跳过） |
-| `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md` |
+| `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md`、`batch-forward.template.md` |
+| `examples/wan-canvas-batch.example.json` | 画布 Wan 批量 manifest 示例（占位邮箱，默认 dry-run） |
 | `examples/accounts.example.json` | CLI 账号占位示例（填自己的 ak/sk） |
 | `HANDOFF.md` | 本文件：积分核验与脚本索引（公开版） |
 
@@ -28,7 +29,7 @@ cd grok-bot-lovart
 
 - **画布 Wan 3.0 480p**：余额 **≥ 时长秒×4+2**，且本条预估 **< 当前余额**（出完后余额仍 >0）。选号：`bin/lovart-cli-pick-recharge.sh canvas <秒>`（不再跳过本日已画布）。
 - **CLI Seedance 2.5**：余额 **>0** 直接交；禁止因「看起来不够」提交前先问。仅平台 Insufficient／余额 0／生成中途不足时停下询问。选号同脚本 `cli` 模式（只跳过本日 Insufficient）。
-- 特殊号（余额 >100）出视频前须用户放行。
+- 特殊号（现场余额 >100）出视频前须用户已经说「发送」，并记在 manifest 的 `user_said_send` 或命令行 `--user-said-send <账号>`。未记录则停（exit 4），不 create。
 - 非 Seedance 2.5 不出 CLI。出图用免费号，充值号只出视频。
 
 ## 画布出片优先级
@@ -39,9 +40,42 @@ cd grok-bot-lovart
 
 正式锁脸须画布 @芯片（三视图全套），禁止裸 `reference_image` 当正式母片。
 
-## 纯请求流水线（`bin/`）
+## 画布 Wan 批量（操作员入口）
 
-默认 **dry-run**（`lovart-wan-pure-master.sh`）。真跑需显式去掉 dry-run。
+默认 **dry-run**，不 POST create。计费必须同时给 `--no-dry-run` 和 `--allow-create-once`。只给其中一个会 exit 6。
+
+```bash
+bin/lovart-wan-batch.sh --manifest examples/wan-canvas-batch.example.json
+bin/lovart-wan-batch.sh --manifest /path/manifest.json --no-dry-run --allow-create-once
+bin/lovart-wan-item.sh --prompt P.md --staging DIR --project ID --profile N \
+  --account L24 --expect-email you@example.invalid --duration 12 --intent NAME \
+  --output-mp4 01-wan-母片.mp4 \
+  --mac-product-dir "/Volumes/.../成品/.../母片" \
+  --mac-project-dir "/Volumes/.../项目/.../母片" \
+  --env img1 --front img2 --oblique img3 --side img4 --audio audio1
+```
+
+`lovart-wan-batch.sh` 读 manifest，按列表串行调用 `lovart-wan-pure-master.sh`。计费时 pure-master 在现场询价通过后只调用一次 `lovart-wan-create-once.cjs`，成功后 `lovart-wan-finish-item.cjs` 再调用 `lovart-wan-poll-download.cjs` 与 `lovart-wan-write-gate-result.cjs`，写下 size、md5、片长、`CANVAS-GATE.md`、`RESULT.md`。每条结束和整批结束都写出片进度，可原样转发的句子来自 `docs/batch-forward.template.md`。
+
+Manifest 每条要有提示词路径、staging、时长、intent、输出 mp4 文件名。共用字段是成品/项目母片目录，以及账号池：账号 id、Chrome Profile、期望邮箱、已有画布 `project_id`。
+
+### 硬规则
+
+脚本里直接判断，停批时把原因写进出片进度和转发句：
+
+- 同一充值号连续最多 2 条。第 2 条仍须过上一节的画布门闩：现场余额 ≥ 时长秒×4+2，且现场报价 < 当前余额。报价来自平台 pricing，脚本不另算更低单价。
+- 同一账号做完第 N 条（含下载或明确失败）才开始第 N+1。整批一个进程串行，并用 `/tmp/lovart-wan-batch.lock` 挡住另一个批次同时 create。
+- 门闩失败，或平台返回 Insufficient／无积分：停批并写明原因。账号停在 manifest 指定的这一户。
+- 现场余额 >100：没有 `user_said_send` 或 `--user-said-send` 就不 create，exit 4，并写明需要用户说「发送」。
+- 同一 intent 一旦已有成功的 `generator_task_id`，不再 POST。疑似双扣仍只走 create-once：写 ALERT 后停批。
+- 下载成功后只写 Mac 拷贝配方（box 路径、md5、size、两个母片目录；大于 10MiB 则拆成 `.partNNN`）。目标目录没核到文件之前，转发句保持「Mac 未拷贝，三处 md5 未核」。box 侧 CopyFromBox 和 Mac 上的 `lovart-wan-copy-mac-master.sh` 要另外做。显式 `--run-mac-copy` 且卷不可达时 exit 4。
+- 成片后等用户说「剪」。脚本不交接剪辑。
+
+退出码：0 本批按规则跑完（Mac 仍可能待人工）；2 用法；3 无号或积分门闩；4 需用户（特殊号未放行、Insufficient、Mac 卷不可达）；6 政策停（连续超过 2 条、拒绝第二次 create、双扣 ALERT）。
+
+Chrome 切 Profile 只用 `lovart-canvas-chrome.sh`。每次操作前跑 `lovart-anti-cookie-ensure.sh`。选号脚本会跑。计费时如果它退出 3（没有能过余额门槛的号），批次停。如果它给出另一个账号，批次仍用 manifest 里的这一户。dry-run 把选号结果写在出片进度的附注里，仍用 manifest 里的账号，并且不 create。
+
+### 内部步骤（由上面的入口调用）
 
 1. `lovart-wan-prep-staging.cjs` — 抽前缀/块/时长，拷四图一音  
 2. `lovart-wan-extract-token.cjs` — 从已登录 CDP Chrome 取 usertoken  
@@ -49,9 +83,10 @@ cd grok-bot-lovart
 4. `lovart-wan-upload-and-body.cjs` — 上传素材 + pricing + 组 create body（真芯片）  
 5. `lovart-wan-create-once.cjs` — **单次** POST + flock + ledger（防双扣；解析优先 `generator_task_id`）  
 6. `lovart-wan-poll-download.cjs` — 轮询并下载 mp4  
-7. `lovart-wan-write-gate-result.cjs` — 写 GATE 结果行  
-8. `lovart-wan-copy-mac-master.sh` — 双目录拷 Mac + 三处 md5  
-9. `lovart-wan-pure-master.sh` — 外壳串起来  
+7. `lovart-wan-write-gate-result.cjs` — 写 GATE / RESULT  
+8. `lovart-wan-finish-item.cjs` — 把 6、7 和 Mac 配方接在 create 成功之后  
+9. `lovart-wan-copy-mac-master.sh` — 在 Mac 上双目录拷贝 + 三处 md5（本仓的批量入口默认不跑它）  
+10. `lovart-wan-pure-master.sh` — ensure → prep → pick → token → sign → upload → 可选的一次 create → finish  
 
 配套：`lovart-wan-parse-task-id.cjs`、`lovart-wan-ledger-close.cjs`。旧 sign-and-create 入口应 `exit 99`。详见 `docs/wan-double-create-2026-10-31.md`。
 

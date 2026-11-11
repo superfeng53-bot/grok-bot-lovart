@@ -1,0 +1,43 @@
+{
+  "note": "占位示例。expect_email 与 project_id 不是登录凭据，里面没有 ak/sk。默认 dry-run，不会 POST create。fixture_balance / fixture_price 只在 dry-run 里演练门闩；计费时脚本忽略它们，改用现场 pricing。同一账号连续两条，且第二条的 fixture 仍然过门闩（余额 ≥ 时长秒×4+2 且报价 < 余额）。",
+  "mac_product_dir": "/Volumes/外接硬盘/短视频/成品/示例项目/母片",
+  "mac_project_dir": "/Volumes/外接硬盘/短视频/项目/示例项目/母片",
+  "assets": {
+    "env": "examples/fixtures/assets/img1-env.jpg",
+    "front": "examples/fixtures/assets/img2-front.png",
+    "oblique": "examples/fixtures/assets/img3-oblique.png",
+    "side": "examples/fixtures/assets/img4-side.png",
+    "audio": "examples/fixtures/assets/audio1.mp3"
+  },
+  "accounts": [
+    {
+      "id": "L24",
+      "chrome_profile": 24,
+      "expect_email": "replace-me@example.invalid",
+      "project_id": "proj_example_do_not_bill",
+      "user_said_send": false
+    }
+  ],
+  "items": [
+    {
+      "prompt": "examples/fixtures/wan-prompt-01.md",
+      "staging": "item-01",
+      "duration": 12,
+      "intent": "example-wan-01",
+      "output_mp4": "01-example-wan-母片.mp4",
+      "account_id": "L24",
+      "fixture_balance": 80,
+      "fixture_price": 48
+    },
+    {
+      "prompt": "examples/fixtures/wan-prompt-02.md",
+      "staging": "item-02",
+      "duration": 8,
+      "intent": "example-wan-02",
+      "output_mp4": "02-example-wan-母片.mp4",
+      "account_id": "L24",
+      "fixture_balance": 60,
+      "fixture_price": 32
+    }
+  ]
+}
