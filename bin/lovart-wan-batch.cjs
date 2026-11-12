@@ -374,7 +374,7 @@ function renderItemLine(templates, report) {
     size: blank(report.size, '（无）'),
     md5: blank(report.md5, '（无）'),
     mp4_duration: blank(report.mp4_duration, '（无）'),
-    mac_status: report.mac_status || 'Mac 未拷贝，三处 md5 未核',
+    mac_status: report.mac_status || 'Mac 未拷贝，两处 md5 未核',
     note: report.note || '（无）',
   });
 }
@@ -412,7 +412,7 @@ function writeAggregate(outDir, templates, reports, summary) {
     lines.push(`- size: ${blank(report.size, '（无）')}`);
     lines.push(`- md5: ${blank(report.md5, '（无）')}`);
     lines.push(`- 片长: ${blank(report.mp4_duration, '（无）')}`);
-    lines.push(`- Mac: ${report.mac_status || 'Mac 未拷贝，三处 md5 未核'}`);
+    lines.push(`- Mac: ${report.mac_status || 'Mac 未拷贝，两处 md5 未核'}`);
     if (report.detail) lines.push(`- 附注: ${report.detail}`);
     lines.push('');
     lines.push('### 可原样转发');
@@ -440,11 +440,12 @@ function writeItemFiles(staging, markdownSnippet, sentence) {
   fs.writeFileSync(path.join(staging, '转发.txt'), sentence + '\n');
 }
 
-function pendingRecipe(staging, item, macProduct, macProject) {
+function pendingRecipe(staging, item, macProject) {
   const name = item.output_mp4;
   const recipe = {
     mac_copy_status: 'not_downloaded',
     mac_verified: false,
+    two_md5_ok: false,
     three_md5_ok: false,
     box_path: '',
     md5: '',
@@ -452,18 +453,15 @@ function pendingRecipe(staging, item, macProduct, macProject) {
     split: false,
     limit_bytes: 10 * 1024 * 1024,
     parts: [],
-    mac_product_dir: macProduct,
     mac_project_dir: macProject,
     output_name: name,
-    note: '尚无成片。未执行 CopyFromBox，未跑 Mac 拷贝，三处 md5 未核。',
+    note: '尚无成片。未执行 CopyFromBox，未跑 Mac 拷贝，两处 md5 未核。母片拷到项目夹 母片/。',
     mac_command: [
       'lovart-wan-copy-mac-master.sh',
       '--name',
       shellQuote(name),
       '--src',
       shellQuote(`~/.grok-staging/${name}`),
-      '--mac-product-dir',
-      shellQuote(macProduct),
       '--mac-project-dir',
       shellQuote(macProject),
     ].join(' '),
@@ -488,7 +486,7 @@ function baseReport(partial) {
     size: partial.size == null ? '' : partial.size,
     md5: partial.md5 || '',
     mp4_duration: partial.mp4_duration == null ? '' : partial.mp4_duration,
-    mac_status: partial.mac_status || 'Mac 未拷贝，三处 md5 未核',
+    mac_status: partial.mac_status || 'Mac 未拷贝，两处 md5 未核',
     note: partial.note || '',
     detail: partial.detail || '',
     stateLabel: partial.stateLabel || '',
@@ -751,8 +749,6 @@ function runItem(ctx) {
     account.expect_email,
     '--out-mp4',
     item.mp4Abs,
-    '--mac-product-dir',
-    ctx.macProduct,
     '--mac-project-dir',
     ctx.macProject,
     '--skip-pick',
@@ -857,9 +853,9 @@ function runItem(ctx) {
       detail: pickNote,
       stateLabel: 'dry-run 未 create',
       code: 0,
-      mac_status: 'Mac 未拷贝，三处 md5 未核',
+      mac_status: 'Mac 未拷贝，两处 md5 未核',
     });
-    pendingRecipe(staging, item, ctx.macProduct, ctx.macProject);
+    pendingRecipe(staging, item, ctx.macProject);
     const gateArgs = writeDryGate(staging, report, duration, account.project_id);
     const gate = spawnLogged(trace, process.execPath, gateArgs);
     if (gate.status !== 0) {
@@ -875,7 +871,7 @@ function runItem(ctx) {
     }
     fs.writeFileSync(
       path.join(staging, 'item-status.json'),
-      JSON.stringify({ ...report, dry_run: true, created: false, mac_verified: false, three_md5_ok: false }, null, 2)
+      JSON.stringify({ ...report, dry_run: true, created: false, mac_verified: false, two_md5_ok: false, three_md5_ok: false }, null, 2)
     );
     return { code: 0, report };
   }
@@ -912,8 +908,6 @@ function finishArgsFor(item, account, staging, opts) {
     account.expect_email,
     '--out-mp4',
     item.mp4Abs,
-    '--mac-product-dir',
-    item.macProduct,
     '--mac-project-dir',
     item.macProject,
   ];
@@ -939,7 +933,7 @@ function reportFromStatus(index, account, item, status, overlay) {
     size: status.size,
     md5: status.md5,
     mp4_duration: status.mp4_duration,
-    mac_status: status.mac_verified ? 'Mac 已核，三处 md5 一致' : 'Mac 未拷贝，三处 md5 未核',
+    mac_status: status.mac_verified ? 'Mac 已核，两处 md5 一致' : 'Mac 未拷贝，两处 md5 未核',
     note: overlay.note,
     stateLabel: overlay.stateLabel,
     code: overlay.code,
@@ -966,7 +960,9 @@ function executeManifest(manifest, opts, manifestDir) {
 
   const accounts = new Map();
   for (const a of manifest.accounts || []) accounts.set(a.id, a);
-  const macProduct = manifest.mac_product_dir;
+  if (manifest.mac_product_dir) {
+    console.error('WARN: manifest.mac_product_dir 已废弃，忽略');
+  }
   const macProject = manifest.mac_project_dir;
   const prepared = [];
   const seenIntent = new Set();
@@ -999,7 +995,6 @@ function executeManifest(manifest, opts, manifestDir) {
       promptAbs: resolveExisting(raw.prompt, manifestDir),
       mp4Abs: path.join(stagingAbs, '04-生成', raw.output_mp4),
       assets,
-      macProduct,
       macProject,
       account,
     });
@@ -1047,7 +1042,6 @@ function executeManifest(manifest, opts, manifestDir) {
         trace,
         index: i + 1,
         streak,
-        macProduct,
         macProject,
       });
     } catch (e) {
@@ -1073,7 +1067,7 @@ function executeManifest(manifest, opts, manifestDir) {
       sentence
     );
     if (!fs.existsSync(path.join(item.stagingAbs, 'copy-recipe.json'))) {
-      pendingRecipe(item.stagingAbs, item, item.macProduct, item.macProject);
+      pendingRecipe(item.stagingAbs, item, item.macProject);
     }
     console.log(sentence);
     if (outcome.code !== 0) {
@@ -1111,7 +1105,7 @@ function executeManifest(manifest, opts, manifestDir) {
 function validateManifest(manifest) {
   if (!manifest || !Array.isArray(manifest.accounts) || !manifest.accounts.length) return 'accounts 不能为空';
   if (!Array.isArray(manifest.items) || !manifest.items.length) return 'items 不能为空';
-  if (!manifest.mac_product_dir || !manifest.mac_project_dir) return '需要 mac_product_dir 与 mac_project_dir';
+  if (!manifest.mac_project_dir) return '需要 mac_project_dir（项目夹母片目录）';
   for (const a of manifest.accounts) {
     if (!a.id || a.chrome_profile == null || !a.expect_email || !a.project_id) {
       return `账号字段不全（id / chrome_profile / expect_email / project_id）: ${a.id || '?'}`;
@@ -1257,7 +1251,7 @@ function onceCli(argv) {
   const refused = flagsRefuse(opts);
   if (refused) return refused;
   const o = opts.once;
-  const need = ['prompt', 'staging', 'project', 'profile', 'account', 'email', 'duration', 'intent', 'output', 'macProduct', 'macProject'];
+  const need = ['prompt', 'staging', 'project', 'profile', 'account', 'email', 'duration', 'intent', 'output', 'macProject'];
   for (const k of need) {
     if (!o[k]) {
       console.error(`--once 缺少 --${k === 'macProduct' ? 'mac-product-dir' : k === 'macProject' ? 'mac-project-dir' : k === 'output' ? 'output-mp4' : k === 'email' ? 'expect-email' : k}`);
@@ -1272,7 +1266,6 @@ function onceCli(argv) {
   }
   if (o.userSaid) opts.userSaid.push(o.account);
   const manifest = {
-    mac_product_dir: o.macProduct,
     mac_project_dir: o.macProject,
     assets: { env: o.env, front: o.front, oblique: o.oblique, side: o.side, audio: o.audio },
     accounts: [
@@ -1374,7 +1367,8 @@ function help() {
 lovart-wan-item.sh 同脚本 --once，单条参数：
   --prompt --staging --project --profile --account --expect-email
   --duration --intent --output-mp4
-  --mac-product-dir --mac-project-dir
+  --mac-project-dir
+  [--mac-product-dir]  兼容旧参数，忽略
   [--fixture-balance N --fixture-price N] [--user-said-send]
   [--env --front --oblique --side --audio]
   [--consecutive N]   大于 2 则 exit 6
