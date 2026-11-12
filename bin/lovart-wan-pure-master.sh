@@ -50,7 +50,8 @@ lovart-wan-pure-master.sh — pure-request pipeline shell (default --dry-run, NO
   --out-body PATH
   --out-mp4 PATH       passed to finish-item after a successful create
   --account ID --expect-email ADDR
-  --mac-product-dir DIR --mac-project-dir DIR
+  --mac-project-dir DIR
+  --mac-product-dir DIR   兼容旧参数，忽略，不转发给收尾脚本
   --env/--front/--oblique/--side/--audio PATH   forwarded to prep-staging
   --wasm PATH
   --dry-run            default ON
@@ -204,7 +205,7 @@ run_finish() {
   if [ -n "$OUT_MP4" ]; then args+=(--out-mp4 "$OUT_MP4"); fi
   if [ -n "$ACCOUNT" ]; then args+=(--account "$ACCOUNT"); fi
   if [ -n "$EXPECT_EMAIL" ]; then args+=(--expect-email "$EXPECT_EMAIL"); fi
-  if [ -n "$MAC_PROD" ]; then args+=(--mac-product-dir "$MAC_PROD"); fi
+  if [ -n "$MAC_PROD" ]; then echo "WARN: --mac-product-dir 已废弃，忽略" >&2; fi
   if [ -n "$MAC_PROJ" ]; then args+=(--mac-project-dir "$MAC_PROJ"); fi
   if [ -n "$WASM" ]; then args+=(--wasm "$WASM"); fi
   "${args[@]}"

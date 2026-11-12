@@ -7,7 +7,7 @@
  *
  * 大于 10MiB 时在 box 上拆成 .partNNN，供之后 CopyFromBox。
  * 不运行 lovart-wan-copy-mac-master.sh，除非显式 --run-mac-copy，
- * 且只有该脚本打印 three_md5_ok 才把 Mac 标成已核验。
+ * 且只有该脚本打印 two_md5_ok（或兼容字段 three_md5_ok）才把 Mac 标成已核验。
  *
  * Exit: 0 下载并写完（Mac 默认仍未核）；2 用法；4 需用户（无成片/任务失败/Mac 卷不可达）；
  *       其他码来自 poll（5 任务失败会改写成 4）。
@@ -92,6 +92,7 @@ function writeRecipe(staging, info) {
   const recipe = {
     mac_copy_status: 'recipe_only',
     mac_verified: false,
+    two_md5_ok: false,
     three_md5_ok: false,
     box_path: info.boxPath,
     md5: info.md5,
@@ -99,12 +100,11 @@ function writeRecipe(staging, info) {
     split: info.split.split,
     limit_bytes: info.split.limit_bytes,
     parts: info.split.parts,
-    mac_product_dir: info.macProduct || '',
     mac_project_dir: info.macProject || '',
     output_name: path.basename(info.boxPath),
     note:
       '只准备 box 侧配方。CopyFromBox 与 Mac 上 lovart-wan-copy-mac-master.sh 未执行。' +
-      '目标目录未核验，三处 md5 不能写成已通过。',
+      '目标目录未核验，两处 md5（box 与项目夹）不能写成已通过。母片拷到项目夹 母片/。',
     mac_command: info.macCommand,
   };
   const jsonPath = path.join(staging, 'copy-recipe.json');
@@ -117,11 +117,10 @@ function writeRecipe(staging, info) {
     '',
     `- mac_copy_status: ${recipe.mac_copy_status}`,
     `- mac_verified: false`,
-    `- three_md5_ok: false`,
+    `- two_md5_ok: false`,
     `- box_path: ${recipe.box_path}`,
     `- md5: ${recipe.md5}`,
     `- size: ${recipe.size}`,
-    `- 成品母片目录: ${recipe.mac_product_dir || '（未提供）'}`,
     `- 项目母片目录: ${recipe.mac_project_dir || '（未提供）'}`,
     '',
     '## 拆分',
@@ -131,8 +130,8 @@ function writeRecipe(staging, info) {
     '## 人工步骤',
     '',
     '1. 把 box 上的 mp4（若已拆分则带上 `.partNNN`）CopyFromBox 到 Mac `~/.grok-staging/`。',
-    '2. 在 Mac 上执行下面的命令。体积大于 10MiB 时，Mac 脚本会把 `名称.part*` 拼回去再拷两处母片。',
-    '3. 只有该命令退出 0 且输出 `three_md5_ok: true`，才能说三处 md5 已核。本配方不代表这一步已完成。',
+    '2. 在 Mac 上执行下面的命令。体积大于 10MiB 时，Mac 脚本会把 `名称.part*` 拼回去再拷到项目夹母片。',
+    '3. 只有该命令退出 0 且输出 `two_md5_ok: true`，才能说两处 md5 已核（box 与项目夹）。本配方不代表这一步已完成。',
     '',
     '```bash',
     recipe.mac_command,
@@ -154,8 +153,6 @@ function macCommand(info) {
     shellQuote(name),
     '--src',
     shellQuote(`~/.grok-staging/${name}`),
-    '--mac-product-dir',
-    shellQuote(info.macProduct || ''),
     '--mac-project-dir',
     shellQuote(info.macProject || ''),
   ];
@@ -192,8 +189,7 @@ function gateSets(status) {
     ['size', status.size == null ? '' : status.size],
     ['artifact_url', status.artifact_url || ''],
     ['mac_copy_status', status.mac_copy_status],
-    ['mac_md5_ok', status.three_md5_ok ? 'true' : 'false'],
-    ['mac_path_成品', status.mac_product_file || ''],
+    ['mac_md5_ok', status.two_md5_ok ? 'true' : 'false'],
     ['mac_path_项目', status.mac_project_file || ''],
     ['ok', status.ok ? 'true' : 'false'],
     ['billable_creates', status.billable_creates],
@@ -201,7 +197,7 @@ function gateSets(status) {
     ['note', status.note],
     ['title', status.intent],
   ];
-  if (status.three_md5_ok && status.md5) pairs.push(['mac_md5', status.md5]);
+  if (status.two_md5_ok && status.md5) pairs.push(['mac_md5', status.md5]);
   const args = [];
   for (const [k, v] of pairs) args.push('--set', `${k}=${v == null ? '' : v}`);
   return args;
@@ -215,7 +211,8 @@ function help() {
   --out-mp4 PATH         default <staging>/04-生成/<intent>-wan-母片.mp4
   --token-file PATH | env LOVART_TOKEN
   --profile N --account ID --expect-email ADDR
-  --mac-product-dir DIR --mac-project-dir DIR
+  --mac-project-dir DIR   项目夹母片目录（必填才能核 Mac）
+  --mac-product-dir DIR   兼容旧参数，忽略
   --wasm PATH
   --run-mac-copy         actually run lovart-wan-copy-mac-master.sh (fails if the Mac volume is unreachable)
 `);
@@ -343,7 +340,6 @@ function main() {
 
   let macVerified = false;
   let macStatus = 'recipe_only';
-  let macProductFile = '';
   let macProjectFile = '';
   if (has('--run-mac-copy')) {
     const copy = spawnSync(
@@ -353,8 +349,6 @@ function main() {
         path.basename(outMp4),
         '--src',
         outMp4,
-        '--mac-product-dir',
-        macProduct,
         '--mac-project-dir',
         macProject,
         '--box-md5',
@@ -370,10 +364,9 @@ function main() {
     } catch {
       parsed = null;
     }
-    if (copy.status === 0 && parsed && parsed.three_md5_ok === true) {
+    if (copy.status === 0 && parsed && (parsed.two_md5_ok === true || parsed.three_md5_ok === true)) {
       macVerified = true;
       macStatus = 'verified';
-      macProductFile = parsed.mac_product || '';
       macProjectFile = parsed.mac_project || '';
     } else {
       const status = baseStatus({
@@ -437,8 +430,8 @@ function main() {
     resumed ? '沿用已有 generator_task_id，本次未再 POST create。' : 'create-once 一次成功后已下载。',
     probed.source === 'ffprobe' ? `片长 ${probed.seconds}s（ffprobe）。` : '未能 ffprobe，片长未冒充成请求时长。',
     macVerified
-      ? 'Mac 两处母片已核，三处 md5 一致。'
-      : 'Mac 未拷贝，三处 md5 未核。见 copy-recipe。',
+      ? 'Mac 项目夹母片已核，两处 md5 一致（box 与项目夹）。'
+      : 'Mac 未拷贝，两处 md5 未核。见 copy-recipe。',
     '不自动剪辑。等用户说「剪」。',
   ];
   const status = baseStatus({
@@ -463,7 +456,6 @@ function main() {
     billable: resumed ? '0' : '1',
     macStatus,
     macVerified,
-    macProductFile,
     macProjectFile,
   });
   status.copy_recipe = recipeOut.jsonPath;
@@ -503,8 +495,8 @@ function baseStatus(o) {
     artifact_url: o.artifact || '',
     mac_copy_status: o.macStatus || 'recipe_only',
     mac_verified: !!o.macVerified,
+    two_md5_ok: !!o.macVerified,
     three_md5_ok: !!o.macVerified,
-    mac_product_file: o.macProductFile || '',
     mac_project_file: o.macProjectFile || '',
     billable_creates: o.billable || '0',
     stopped_short: o.stopped || '',

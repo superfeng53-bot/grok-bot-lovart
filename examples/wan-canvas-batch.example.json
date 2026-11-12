@@ -1,6 +1,5 @@
 {
   "note": "占位示例。expect_email 与 project_id 不是登录凭据，里面没有 ak/sk。默认 dry-run，不会 POST create。fixture_balance / fixture_price 只在 dry-run 里演练门闩；计费时脚本忽略它们，改用现场 pricing。同一账号连续两条，且第二条的 fixture 仍然过门闩（余额 ≥ 时长秒×4+2 且报价 < 余额）。",
-  "mac_product_dir": "/Volumes/外接硬盘/短视频/成品/示例项目/母片",
   "mac_project_dir": "/Volumes/外接硬盘/短视频/项目/示例项目/母片",
   "assets": {
     "env": "examples/fixtures/assets/img1-env.jpg",
