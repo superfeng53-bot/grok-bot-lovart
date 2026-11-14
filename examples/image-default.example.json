@@ -1,0 +1,19 @@
+{
+  "note": "出图默认参数示例。没有账号、邮箱或密钥。本文件不发起登录、生成或计费。",
+  "effective": "2026-11-13",
+  "task": "image",
+  "display_name": "Seedream 5.5",
+  "tool": "generate_image_seedream_v5_5",
+  "prefer_models": {
+    "IMAGE": ["generate_image_seedream_v5_5"]
+  },
+  "include_tools": ["generate_image_seedream_v5_5"],
+  "include_tools_is_enforced_whitelist": false,
+  "read_result_fields": ["failures", "warning"],
+  "actual_tool_source": "result_record",
+  "mode": "fast",
+  "account_kind": "free",
+  "source_image_edit_verified": false,
+  "video_tool_unchanged": "generate_video_seedance_v2_5",
+  "canvas_generator_unchanged": "wan/wan-3-0"
+}

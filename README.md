@@ -19,7 +19,10 @@ cd grok-bot-lovart
 | `bin/` | 画布 Wan 批量入口、纯请求、选号、拷 Mac、防 cookie、画布 Chrome |
 | `lovart-auto/` | 每日积分到账程序化扫号（CDP + supercronic；crontab 已 `timeout` 包裹，防任务挂死跨天跳过） |
 | `docs/` | 双扣根因备忘、`CANVAS-GATE.template.md`、`DISPATCH-ROUNDS.md`、`batch-forward.template.md` |
+| `docs/SUBMIT-DEFAULTS.md` | 出图默认 Seedream 5.5。CLI 视频与画布 Wan 仍以本文件正文为准 |
+| `docs/skills/lovart-seedance.md` | 静图提交摘录（Seedream 5.5）。CLI 视频规则仍以本文件正文为准 |
 | `examples/wan-canvas-batch.example.json` | 画布 Wan 批量 manifest 示例（占位邮箱，默认 dry-run） |
+| `examples/image-default.example.json` | 出图默认：Seedream 5.5（无账号、无密钥、不发起生成） |
 | `examples/accounts.example.json` | CLI 账号占位示例（填自己的 ak/sk） |
 | `HANDOFF.md` | 本文件：积分核验与脚本索引（公开版） |
 
@@ -31,6 +34,18 @@ cd grok-bot-lovart
 - **CLI Seedance 2.5**：余额 **>0** 直接交；禁止因「看起来不够」提交前先问。仅平台 Insufficient／余额 0／生成中途不足时停下询问。选号同脚本 `cli` 模式（只跳过本日 Insufficient）。
 - 特殊号（现场余额 >100）出视频前须用户已经说「发送」，并记在 manifest 的 `user_said_send` 或命令行 `--user-said-send <账号>`。未记录则停（exit 4），不 create。
 - 非 Seedance 2.5 不出 CLI。出图用免费号，充值号只出视频。
+
+## 出图默认（2026-11-13）
+
+封面、线稿、画中画静图等静图默认模型是 **Seedream 5.5**，工具名 `generate_image_seedream_v5_5`。出图用免费号；充值号只出视频。CLI 视频默认保持 Seedance 2.5（`generate_video_seedance_v2_5`）。画布默认保持 Wan 3.0。
+
+```bash
+--prefer-models '{"IMAGE":["generate_image_seedream_v5_5"]}' \
+--include-tools generate_image_seedream_v5_5 \
+--mode fast
+```
+
+`--include-tools` 是强引导。被请求的工具拒单后，Agent 仍可能改用别的工具。跑完先读结果里的 `failures` 和 `warning`。`failures` 非空时，按被拒的工具和原因回报。实际调用的工具以结果记录为准；请求参数里的工具名只表示提交时的引导。带原图的编辑未在本仓实测，不列入已支持能力。机器可读副本：`examples/image-default.example.json`。
 
 ## 画布出片优先级
 
