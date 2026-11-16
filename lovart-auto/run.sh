@@ -1,8 +1,10 @@
 #!/bin/bash
-# Lovart 每日积分检查入口（程序化，不经模型）。日期一律自动取 Asia/Shanghai。
+# Lovart 每日积分检查入口（程序化，不经模型）。日期一律 Asia/Shanghai。
 #   run.sh first     第一轮：查全部在用号（9:00）
-#   run.sh recheck   重查：只查 pending_today.profiles（10:00/11:00）；当天全部有结论则直接退出
+#   run.sh recheck   重查：只查该业务日已有 first 的 pending；没有 first 则拒绝，不升成 first
 # 其余参数原样传给 lovart_auto.py，例如：run.sh first --dry-run --profiles 4,5
+# 延迟到次日的重查把原业务日传下去：run.sh recheck --today YYYY-MM-DD
+# （只多传业务日，不改 crontab 时刻、timeout 或锁。）
 #
 # 注意：本脚本内部已 flock /tmp/lovart-auto.lock。禁止再包一层 flock（会死锁）。
 # crontab 须用 timeout 包本脚本，防止单轮挂死让 supercronic 跨天跳过同名任务。
@@ -11,7 +13,7 @@ set -u
 # 防 Cookie：扫号前确保无 persist/session-sync（不用 LLM）
 /home/box/bin/lovart-anti-cookie-ensure.sh || exit 1
 MODE="${1:-}"
-case "$MODE" in first|recheck) shift ;; *) echo "usage: $0 first|recheck [--dry-run --out-dir D --profiles 4,5]" >&2; exit 64 ;; esac
+case "$MODE" in first|recheck) shift ;; *) echo "usage: $0 first|recheck [--dry-run --out-dir D --profiles 4,5 --today YYYY-MM-DD]" >&2; exit 64 ;; esac
 
 export TZ=Asia/Shanghai LANG=C.UTF-8 HOME=/home/box
 export PATH=/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin
