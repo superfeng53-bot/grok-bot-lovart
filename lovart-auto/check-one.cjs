@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-const puppeteer = require('/home/box/tools/hypit/node_modules/.pnpm/puppeteer-core@25.10.0/node_modules/puppeteer-core');
 const expected = process.argv[2] || '';
 // TODAY: argv[3] > env LOVART_TODAY > current Asia/Shanghai date. Never edit this file per day.
 function shanghaiToday() {
@@ -14,6 +13,119 @@ function parseCreditsNum(s) {
   if (s == null || s === '') return null;
   const n = Number(String(s).replace(/,/g, '').trim());
   return Number.isFinite(n) ? n : null;
+}
+
+/** 邮箱 @ 前的纯数字，以及本地部分里不少于 6 位的数字串。不得当总额。 */
+function emailLocalPoisonNumbers(email) {
+  const local = String(email || '').split('@')[0];
+  const out = new Set();
+  if (/^\d+$/.test(local)) {
+    const n = Number(local);
+    if (Number.isSafeInteger(n)) out.add(n);
+  }
+  const re = /\d{6,}/g;
+  let m;
+  while ((m = re.exec(local))) {
+    const n = Number(m[0]);
+    if (Number.isSafeInteger(n)) out.add(n);
+  }
+  return out;
+}
+
+function renewalDayPoisonFromText(text) {
+  const poison = new Set();
+  const s = String(text || '');
+  for (const m of s.matchAll(/(?:下次续费|有效期至|续费时间|Renew)[^0-9\n]{0,16}20\d{2}-(\d{2})-(\d{2})/gi)) {
+    poison.add(Number(m[2]));
+  }
+  for (const m of s.matchAll(/(?:下次续费|有效期至|续费时间)[^0-9\n]{0,16}\d{4}年\d{1,2}月(\d{1,2})日/g)) {
+    poison.add(Number(m[1]));
+  }
+  return poison;
+}
+
+function looksLikeTopbarFraction(tb, todayRemaining) {
+  return typeof tb === 'number' && todayRemaining != null && tb < 100 && tb <= todayRemaining;
+}
+
+function looksRealTopbar(tb, todayRemaining) {
+  if (typeof tb !== 'number' || !(tb > 0)) return false;
+  if (looksLikeTopbarFraction(tb, todayRemaining)) return false;
+  return tb >= 100 || (todayRemaining != null && tb > todayRemaining);
+}
+
+function apiTextIsNoLogin(apiError, apiMsg) {
+  return /no\s*login|未登录|not\s+logged\s+in/i.test(String(apiError || '') + ' ' + String(apiMsg || ''));
+}
+
+/**
+ * 决定本轮总额。No login / 邮箱本地数字 / 本日回退不得冒充可靠总额。
+ * 已登录且 usablePower 为合法数字时仍以 API 为准；与邮箱本地数字撞车则丢掉。
+ * ctx: { email, todayRemaining, monthRemaining, topbar, pageTotal, usablePower,
+ *        apiLoggedIn, apiError, apiMsg, renewal, pageText, noLogin }
+ */
+function resolveCheckerBalance(ctx) {
+  const c = ctx || {};
+  const poison = emailLocalPoisonNumbers(c.email);
+  const today = (typeof c.todayRemaining === 'number') ? c.todayRemaining : null;
+  const month = (typeof c.monthRemaining === 'number') ? c.monthRemaining : null;
+  const noLogin = c.noLogin === true || apiTextIsNoLogin(c.apiError, c.apiMsg);
+  const renDays = renewalDayPoisonFromText(
+    `${c.renewal ? '下次续费 ' + c.renewal : ''}\n${c.pageText || ''}`
+  );
+  let topbar = (typeof c.topbar === 'number') ? c.topbar : null;
+  let topbarRejected = null;
+  if (typeof topbar === 'number' && poison.has(topbar)) {
+    topbar = null;
+    topbarRejected = 'email_local_digits';
+  } else if (typeof topbar === 'number' && renDays.has(topbar) && topbar <= 31) {
+    topbar = null;
+    topbarRejected = 'renewal_day';
+  }
+  const usable = (typeof c.usablePower === 'number' && Number.isFinite(c.usablePower)) ? c.usablePower : null;
+  const apiLoggedIn = c.apiLoggedIn === true && !noLogin;
+  let total = null;
+  let source = null;
+  let unreliable = null;
+  if (apiLoggedIn && usable != null && usable >= 0) {
+    if (poison.has(usable)) {
+      unreliable = 'email_local_digits';
+    } else {
+      total = usable;
+      source = 'api_usablePower';
+    }
+  } else if (noLogin) {
+    unreliable = 'no_login';
+  } else {
+    let pageTotal = (typeof c.pageTotal === 'number' && c.pageTotal > 0) ? c.pageTotal : null;
+    if (pageTotal != null && (poison.has(pageTotal) || (renDays.has(pageTotal) && pageTotal <= 31 && pageTotal === topbar))) {
+      pageTotal = null;
+    }
+    total = pageTotal;
+    if (total == null && usable == null && today != null && month != null) {
+      const sum = today + month;
+      if (sum > today && sum > month && !poison.has(sum)) total = sum;
+    }
+    if (typeof topbar === 'number' && topbar > 0 && !poison.has(topbar) && looksRealTopbar(topbar, today)) {
+      total = total == null ? topbar : Math.max(total, topbar);
+    }
+    if (total != null && poison.has(total)) {
+      total = null;
+      unreliable = 'email_local_digits';
+    }
+    if (total != null && topbar != null && total === topbar) source = 'topbar';
+    else if (total != null) source = 'subscription_or_page';
+    if (total == null) unreliable = unreliable || 'missing_reliable_total';
+  }
+  return {
+    total_balance: total,
+    balance: total != null ? total : null,
+    topbar_lightning: topbar,
+    topbar_rejected: topbarRejected,
+    note_balance_source: source,
+    note_balance_fallback: null,
+    note_balance_unreliable: total == null ? (unreliable || 'missing_reliable_total') : null,
+  };
 }
 
 /** DOM 可用积分：Layout A 右上近「升级」；Layout B 左侧栏底部闪电。
@@ -555,7 +667,8 @@ async function openSubscription(page) {
   return subSnap;
 }
 
-(async () => {
+async function main() {
+  const puppeteer = require('/home/box/tools/hypit/node_modules/.pnpm/puppeteer-core@25.10.0/node_modules/puppeteer-core');
   const out = {
     email_seen: null, bonus: null, claimed_time: null, balance: null,
     today_remaining: null, month_remaining: null, total_balance: null,
@@ -926,40 +1039,34 @@ async function openSubscription(page) {
     out.renewal = ledger.renewal;
     out.today_remaining = ledger.todayBal != null ? ledger.todayBal : null;
     out.month_remaining = ledger.monthBal != null ? ledger.monthBal : null;
-    // total_balance：API usablePower 权威；其次订阅/用量页；顶栏小数不得当总额
+    // total_balance：已登录 usablePower 权威；No login / 邮箱本地数字 / 本日回退不得冒充总额。
+    // 顶栏小数与续费「日」仍拒绝。无可靠总额时 balance 保持 null，不用本日顶上。
     const sub = subSnap || {};
     const topbarCands = [ledger.topbar_lightning, sub.topbar_lightning].filter(x => typeof x === 'number');
-    out.topbar_lightning = topbarCands.length ? Math.max(...topbarCands) : null;
+    const rawTopbar = topbarCands.length ? Math.max(...topbarCands) : null;
     const pageTotals = [sub.sub_total, ledger.pageTotal].filter(x => typeof x === 'number' && x > 0);
-    let total = pageTotals.length ? Math.max(...pageTotals) : null;
-    // 回退：本日+本月（仅无 API 时；有 usablePower 时不用，避免 used/周期上限加成假总额）
-    if (total == null && out.usablePower == null && out.today_remaining != null && out.month_remaining != null) {
-      const sum = out.today_remaining + out.month_remaining;
-      if (sum > out.today_remaining && sum > (out.month_remaining || 0)) total = sum;
-    }
-    const tb = out.topbar_lightning;
-    if (typeof tb === 'number' && tb > 0) {
-      // 顶栏小数（<100 且 ≤ today_remaining）不得作为 total
-      const looksLikeFraction = out.today_remaining != null && tb < 100 && tb <= out.today_remaining;
-      const looksReal = !looksLikeFraction && (tb >= 100 || (out.today_remaining != null && tb > out.today_remaining));
-      if (looksReal) {
-        total = total == null ? tb : Math.max(total, tb);
-      }
-    }
-    // API usablePower 覆盖页面启发式（真实可用总额）
-    if (typeof out.usablePower === 'number' && out.usablePower >= 0) {
-      total = out.usablePower;
-      out.note_balance_source = 'api_usablePower';
-    } else if (total != null && out.topbar_lightning === total) {
-      out.note_balance_source = 'topbar';
-    } else if (total != null) {
-      out.note_balance_source = 'subscription_or_page';
-    }
-    out.total_balance = total;
-    out.balance = out.total_balance != null ? out.total_balance : out.today_remaining;
-    if (out.total_balance == null && out.today_remaining != null) {
-      out.note_balance_fallback = 'today_remaining_only';
-    }
+    const pageTotal = pageTotals.length ? Math.max(...pageTotals) : null;
+    const noLogin = apiTextIsNoLogin(out.api_account_error, bodyMsg);
+    const resolved = resolveCheckerBalance({
+      email: expected || out.email_seen || '',
+      todayRemaining: out.today_remaining,
+      monthRemaining: out.month_remaining,
+      topbar: rawTopbar,
+      pageTotal,
+      usablePower: out.usablePower,
+      apiLoggedIn: apiLoggedIn === true && !noLogin,
+      apiError: out.api_account_error,
+      apiMsg: bodyMsg,
+      renewal: out.renewal,
+      noLogin,
+    });
+    out.total_balance = resolved.total_balance;
+    out.balance = resolved.balance;
+    out.topbar_lightning = resolved.topbar_lightning;
+    out.note_balance_source = resolved.note_balance_source;
+    out.note_balance_fallback = resolved.note_balance_fallback;
+    out.note_balance_unreliable = resolved.note_balance_unreliable;
+    if (resolved.topbar_rejected) out.topbar_rejected = resolved.topbar_rejected;
     const apiNote = (typeof out.usablePower === 'number')
       ? `; api usable=${out.usablePower} used=${out.usedPower} totalPower=${out.totalPower} allocToday=${out.powerAllocatedToday}`
       : (out.api_account_error ? `; api_err=${out.api_account_error}` : '');
@@ -996,6 +1103,7 @@ async function openSubscription(page) {
       out.note = `no today Daily Login Bonus; last=${out.last_bonus || 'unknown'}; plan=${out.plan}; 本日=${out.today_remaining}; 总额=${out.total_balance}; topbar=${out.topbar_lightning}; hasDLB=${ledger.hasDLB}` +
         (out.note_balance_fallback ? `; balFallback=${out.note_balance_fallback}` : '') +
         (out.note_balance_source ? `; balSrc=${out.note_balance_source}` : '') +
+        (out.note_balance_unreliable ? `; balUnreliable=${out.note_balance_unreliable}` : '') +
         apiNote;
     } else {
       out.status = 'ok';
@@ -1003,6 +1111,7 @@ async function openSubscription(page) {
         (out.switched_to_classic ? '; switched_new→classic' : '') +
         (out.note_balance_fallback ? `; balFallback=${out.note_balance_fallback}` : '') +
         (out.note_balance_source ? `; balSrc=${out.note_balance_source}` : '') +
+        (out.note_balance_unreliable ? `; balUnreliable=${out.note_balance_unreliable}` : '') +
         apiNote;
     }
     await page.keyboard.press('Escape').catch(() => {});
@@ -1013,4 +1122,17 @@ async function openSubscription(page) {
     out.note = String(e && e.message || e);
     console.log(JSON.stringify(out));
   }
-})();
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  resolveCheckerBalance,
+  emailLocalPoisonNumbers,
+  renewalDayPoisonFromText,
+  looksRealTopbar,
+  looksLikeTopbarFraction,
+  apiTextIsNoLogin,
+};

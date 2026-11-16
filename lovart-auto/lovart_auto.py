@@ -3,15 +3,15 @@
 
 用法（一般通过 run.sh 调用）:
   lovart_auto.py first     第一轮：查全部在用号（当天已开查则只查 pending_today.profiles）
-  lovart_auto.py recheck   重查：只查 pending_today.profiles；当天还没跑过第一轮则自动按第一轮跑
+  lovart_auto.py recheck   重查：只查该业务日已有 first 的 pending。没有 first 则拒绝，不升成 first
 选项:
   --dry-run            只读/测试模式：状态文件用副本，所有输出写到 --out-dir（默认 /tmp/lovart-auto-dryrun-<时间>）
   --out-dir DIR        dry-run 输出目录
   --state-src PATH     dry-run 时拿来复制的状态文件（默认正式状态文件）
   --profiles 4,5,6     只查这些号（测试用；仍会跳过弃用号）
   --force              当天已全部有结论也照样跑；无 --profiles 时仍需 --dry-run；有 --profiles 时可实跑指定号
-  --today YYYY-MM-DD   覆盖日期（只允许和 --dry-run 一起用）
-TODAY 默认一律取 Asia/Shanghai 当前日期。
+  --today YYYY-MM-DD   业务日（实跑与 dry-run 都可用）。延迟到次日的 recheck 必须带原业务日
+业务日默认取 Asia/Shanghai 墙钟日期。recheck 不会因为「这个日期还没有 first」就改跑全员 first。
 """
 import argparse, datetime, json, os, re, shutil, signal, subprocess, sys, time, traceback
 from collections import Counter
@@ -25,7 +25,9 @@ SWITCH = AUTO + "/switch-profile.sh"  # copy of /workspace/lovart-switch-profile
 STATE = WS + "/lovart-daily-credits-state.json"
 LOGMD = WS + "/lovart-daily-credits-log.md"
 BACKUP_DIR = WS + "/backups/lovart-auto"
-HARD_SKIP = {3, 7, 11, 12, 14, 16, 17}
+# 2026-11-09 起弃用只看 state.accounts[].deprecated（与生产运行副本一致）。
+# 不要恢复硬编码旧号，否则已经按 state 复启的账号会被这次补丁再次跳过。
+HARD_SKIP = set()
 CHECK_TIMEOUT = 300
 MAX_ATTEMPTS = 3
 FINAL_HOUR = 11  # 11 点那一轮（或第 3 次）是当天最后一轮
@@ -186,9 +188,9 @@ def check_profile(n, email, today):
 
 # ---------------------------------------------------------------- bookkeeping
 
-def write_balance_snapshot(today, state, day_accounts, ran):
+def write_balance_snapshot(today, state, day_accounts, ran, snap_dir=None):
     """本地余额快照：以后对账优先查当天文件，不靠误读的本日额度。"""
-    snap_dir = WS + "/lovart-balance-snapshots"
+    snap_dir = snap_dir or (WS + "/lovart-balance-snapshots")
     os.makedirs(snap_dir, exist_ok=True)
     path = f"{snap_dir}/{today}.json"
     index_path = f"{snap_dir}/index.md"
@@ -204,16 +206,11 @@ def write_balance_snapshot(today, state, day_accounts, ran):
         rec = by_profile.get(n) or {}
         acc = (state.get("accounts") or {}).get(str(n)) or {}
         today_rem = rec.get("today_remaining") if rec.get("today_remaining") is not None else acc.get("today_remaining")
-        # 快照总额：本轮可靠 total_balance 优先；旧 state.balance 仅在「像真总额」时沿用。
-        # 禁止把被顶栏续费日污染的旧值（如 L15 balance=13）写进当日快照。
+        # 快照总额只写本轮可靠 total_balance。旧 state.balance 不得回填成新读数。
         rec_tot = rec.get("total_balance")
         state_bal = acc.get("balance")
-        if rec_tot is not None:
-            snap_tot = rec_tot
-        elif _topbar_looks_real_total(state_bal, today_rem):
-            snap_tot = state_bal
-        else:
-            snap_tot = None
+        snap_tot = rec_tot if rec_tot is not None else None
+        historical = state_bal if snap_tot is None and isinstance(state_bal, (int, float)) and not isinstance(state_bal, bool) else None
         accounts[str(n)] = {
             "L": f"L{n}",
             "class": acc.get("class") or rec.get("class_after"),
@@ -221,6 +218,8 @@ def write_balance_snapshot(today, state, day_accounts, ran):
             "claimed_time": rec.get("claimed_time"),
             "today_remaining": today_rem,
             "total_balance": snap_tot,
+            "total_balance_historical": historical,
+            "total_balance_historical_note": "prior_state_not_this_round" if historical is not None else None,
             "plan": rec.get("plan") or acc.get("plan"),
             "checked_at": rec.get("checked_at") or iso(),
             "chrome_profile": acc.get("chrome_profile") or n,
@@ -269,11 +268,173 @@ def classify(prior, bonus, balance, note_special=None, today_remaining=None, tot
 
 def _topbar_looks_real_total(tb, today_remaining):
     """顶栏小数（<100 且 ≤ today_remaining）不得抬成 total_balance。"""
-    if not isinstance(tb, (int, float)) or tb <= 0:
+    if isinstance(tb, bool) or not isinstance(tb, (int, float)) or tb <= 0:
         return False
     if today_remaining is not None and tb < 100 and tb <= today_remaining:
         return False
     return tb >= 100 or (today_remaining is not None and tb > today_remaining)
+
+
+_NO_LOGIN_RE = re.compile(r"no\s*login|未登录|not\s+logged\s+in", re.I)
+_RENEWAL_YMD_RE = re.compile(
+    r"(?:下次续费|有效期至|续费时间|Renew)[^0-9\n]{0,16}20\d{2}-\d{2}-(\d{2})", re.I)
+_RENEWAL_CN_RE = re.compile(r"(?:下次续费|有效期至|续费时间)[^0-9\n]{0,16}\d{4}年\d{1,2}月(\d{1,2})日")
+_RENEWAL_ONLY_RE = re.compile(r"\d{4}-\d{2}-(\d{2})")
+
+
+def wall_clock(dry_run):
+    """Asia/Shanghai 墙钟。dry-run 可用 LOVART_AUTO_FAKE_NOW=YYYY-MM-DDTHH:MM:SS 固定时间。"""
+    raw = os.environ.get("LOVART_AUTO_FAKE_NOW") if dry_run else None
+    if not raw:
+        return now()
+    dt = datetime.datetime.fromisoformat(raw.strip())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    else:
+        dt = dt.astimezone(TZ)
+    return dt
+
+
+def email_local_poison_numbers(email):
+    """邮箱 @ 前的纯数字，以及本地部分里不少于 6 位的数字串。不得当总额。"""
+    local = (email or "").split("@", 1)[0]
+    nums = set()
+    if re.fullmatch(r"\d+", local or ""):
+        nums.add(int(local))
+    for m in re.finditer(r"\d{6,}", local or ""):
+        nums.add(int(m.group(0)))
+    return nums
+
+
+def _as_balance_number(n):
+    if isinstance(n, bool) or not isinstance(n, (int, float)):
+        return None
+    if isinstance(n, float) and n.is_integer():
+        return int(n)
+    return n
+
+
+def _is_poison_balance(n, poison):
+    v = _as_balance_number(n)
+    return isinstance(v, int) and v in poison
+
+
+def api_no_login(raw):
+    meta = raw.get("api_account_meta") if isinstance(raw.get("api_account_meta"), dict) else {}
+    blob = " ".join([
+        str(raw.get("api_account_error") or ""),
+        str(meta.get("msg") or ""),
+        str(meta.get("error") or ""),
+    ])
+    return _NO_LOGIN_RE.search(blob) is not None
+
+
+def renewal_day_numbers(raw):
+    days = set()
+    texts = [str(raw.get("renewal") or ""), str(raw.get("note") or "")]
+    for t in texts:
+        for m in _RENEWAL_YMD_RE.finditer(t):
+            days.add(int(m.group(1)))
+        for m in _RENEWAL_CN_RE.finditer(t):
+            days.add(int(m.group(1)))
+    ren = str(raw.get("renewal") or "").strip()
+    m = _RENEWAL_ONLY_RE.fullmatch(ren)
+    if m:
+        days.add(int(m.group(1)))
+    return {d for d in days if 1 <= d <= 31}
+
+
+def resolve_observed_total(raw, email):
+    """本轮可靠总额。
+
+    返回 (total_or_None, reason)。total 为 None 表示本轮没有可靠总额：
+    不得回填旧 state/快照，也不得据此改分类。
+    已登录且 usablePower 为合法数字时仍走权威路径；与邮箱本地数字撞车的值除外。
+    """
+    poison = email_local_poison_numbers(email)
+    today = raw.get("today_remaining")
+    no_login = api_no_login(raw)
+    source = raw.get("note_balance_source") or ""
+    stated = _as_balance_number(raw.get("total_balance"))
+    usable = _as_balance_number(raw.get("usablePower"))
+    meta = raw.get("api_account_meta") if isinstance(raw.get("api_account_meta"), dict) else {}
+    ren_days = renewal_day_numbers(raw)
+
+    def poisoned(n):
+        return _is_poison_balance(n, poison)
+
+    def renewalish(n):
+        v = _as_balance_number(n)
+        return isinstance(v, int) and v in ren_days
+
+    api_source = source == "api_usablePower" or meta.get("ok") is True
+    api_value = usable if usable is not None else (stated if source == "api_usablePower" else None)
+    if not no_login and api_source and api_value is not None and api_value >= 0:
+        if poisoned(api_value):
+            return None, "email_local_digits"
+        return api_value, "api_usablePower"
+    if no_login:
+        return None, "no_login"
+    if raw.get("note_balance_fallback") == "today_remaining_only" and stated is None:
+        return None, "today_remaining_only"
+    if stated is not None and raw.get("note_balance_fallback") != "today_remaining_only":
+        if poisoned(stated):
+            return None, "email_local_digits"
+        if source == "topbar" and renewalish(stated):
+            return None, "renewal_day"
+        if source == "topbar" and not _topbar_looks_real_total(stated, today):
+            return None, "topbar_fraction"
+        if source in ("topbar", "heuristic", "") and renewalish(stated):
+            return None, "renewal_day"
+        return stated, source or "stated"
+    tb = _as_balance_number(raw.get("topbar_lightning"))
+    if tb is not None and tb > 0 and not poisoned(tb) and not renewalish(tb) and _topbar_looks_real_total(tb, today):
+        return tb, "topbar"
+    bal = _as_balance_number(raw.get("balance"))
+    if bal is not None and bal > 0 and not poisoned(bal) and not renewalish(bal):
+        if today is None or bal != today:
+            if _topbar_looks_real_total(bal, today) or (today is not None and bal > today) or bal >= 100:
+                return bal, "heuristic"
+    return None, "missing_reliable_total"
+
+
+def phrase_pending(ns, accs):
+    """按各号自己的 attempt 说「已查 N 次」，不把不同次数并成一句。"""
+    by = {}
+    for n in ns:
+        att = int(accs[n].get("attempt") or 1)
+        by.setdefault(att, []).append(n)
+    parts = []
+    for att in sorted(by):
+        parts.append(f"{join_l(by[att])} 还没到账（已查 {att} 次）")
+    return "，".join(parts)
+
+
+def phrase_not_arrived(ns, accs, st_accs):
+    by = {}
+    for n in ns:
+        att = int(accs[n].get("attempt") or 1)
+        by.setdefault(att, []).append(n)
+    parts = []
+    for att in sorted(by):
+        bits = [f"{L(n)}（已连续 {st_accs[str(n)].get('consecutive_miss_days')} 天）" for n in by[att]]
+        parts.append(f"{'、'.join(bits)}今天查了 {att} 次都没到账")
+    return "，".join(parts)
+
+
+def round_headline(day, summary, mode):
+    accs = list(day.get("accounts") or [])
+    checked = set(summary.get("checked_this_run") or [])
+    per = [(a.get("profile"), a.get("attempt")) for a in accs if L(a.get("profile")) in checked]
+    all_attempts = [a.get("attempt") for a in accs]
+    uniform = bool(all_attempts) and len(set(all_attempts)) == 1 and len(per) == len(accs)
+    final_s = "，当天最后一轮" if summary.get("final") else ""
+    if uniform:
+        return f"本轮第 {all_attempts[0]} 次（{mode}）{final_s}"
+    if not per:
+        return f"本轮第 {day.get('attempt')} 次（{mode}）{final_s}"
+    bits = "、".join(f"{L(n)} 第 {att} 次" for n, att in per)
+    return f"按账号计次（{mode}）：{bits}；未查账号不增加次数{final_s}"
 
 
 def make_rec(n, email, prior, r, attempt, checked_at, note_special=None):
@@ -282,27 +443,24 @@ def make_rec(n, email, prior, r, attempt, checked_at, note_special=None):
         status = "needs_otp"
     bonus = r.get("bonus")
     today_remaining = r.get("today_remaining")
-    total_balance = r.get("total_balance")
-    # balance 字段 = 可用总额（checker 优先 API usablePower / 可靠页面总额）
-    balance = r.get("balance")
-    if total_balance is None and isinstance(balance, (int, float)):
-        # 兼容旧 checker：若 note 标明本日= 且无总额，勿把本日当总额
-        total_balance = None
-    if total_balance is None:
-        # 禁止用非 looksReal 的顶栏小数抬成 total（例：total=null + topbar=29 + today=100）
-        cands = []
-        tb = r.get("topbar_lightning")
-        if _topbar_looks_real_total(tb, today_remaining):
-            cands.append(tb)
-        if isinstance(balance, (int, float)):
-            if today_remaining is None or balance != today_remaining:
-                if _topbar_looks_real_total(balance, today_remaining) or (
-                    today_remaining is not None and balance > today_remaining
-                ) or balance >= 100:
-                    cands.append(balance)
-        total_balance = max(cands) if cands else None
-    # 展示/state 的 balance 只认可靠总额；禁止把本日额度抬成总额（否则特殊号会被误降级）
+    total_balance, bal_reason = resolve_observed_total(r, email)
+    unreliable = total_balance is None
+    # 展示/state 的 balance 只认本轮可靠总额。null 不回填旧值，本日额度也不冒充总额。
     display_balance = total_balance
+    if status == "ok" and unreliable and bonus not in (30, 70):
+        # 不可靠总额不进入 classify，分类保持 prior（+30/+70 仍是原有赠送规则，不看余额）。
+        class_after = prior
+    elif status == "ok":
+        class_after = classify(prior, bonus, total_balance,
+                               note_special=note_special, today_remaining=today_remaining,
+                               total_balance=total_balance)
+    else:
+        class_after = prior
+    topbar = r.get("topbar_lightning")
+    topbar_rejected = None
+    if _is_poison_balance(topbar, email_local_poison_numbers(email)):
+        topbar = None
+        topbar_rejected = "email_local_digits"
     rec = {
         "profile": n,
         "email": email,
@@ -313,7 +471,10 @@ def make_rec(n, email, prior, r, attempt, checked_at, note_special=None):
         "today_remaining": today_remaining,
         "month_remaining": r.get("month_remaining"),
         "total_balance": total_balance,
-        "topbar_lightning": r.get("topbar_lightning"),
+        "balance_source": None if unreliable else bal_reason,
+        "balance_unreliable_reason": bal_reason if unreliable else None,
+        "topbar_lightning": topbar,
+        "topbar_rejected": topbar_rejected,
         "plan": r.get("plan"),
         "renewal": r.get("renewal"),
         "last_bonus": r.get("last_bonus"),
@@ -321,12 +482,7 @@ def make_rec(n, email, prior, r, attempt, checked_at, note_special=None):
         "block_reason": scrub(r.get("note")) if status == "blocked" else None,
         "note": scrub(r.get("note") or ""),
         "class_before": prior,
-        "class_after": (
-            # 分类只看可靠 total_balance；本日额度不算「可靠总额」
-            classify(prior, bonus, total_balance,
-                     note_special=note_special, today_remaining=today_remaining, total_balance=total_balance)
-            if status == "ok" else prior
-        ),
+        "class_after": class_after,
         "layout": r.get("layout"),
         "switched_to_classic": r.get("switched_to_classic"),
         "attempt": attempt,
@@ -334,6 +490,8 @@ def make_rec(n, email, prior, r, attempt, checked_at, note_special=None):
     }
     if status == "email_mismatch":
         rec["note"] = "email mismatch (page shows a different account)"
+    if unreliable and bal_reason:
+        rec["note"] = (rec.get("note") or "") + f"; balUnreliable={bal_reason}"
     return rec
 
 
@@ -353,7 +511,7 @@ def join_l(ns):
     return "、".join(L(n) for n in sorted(ns))
 
 
-def build_summary(day, today, attempt, final, mode, state, errors, files, ran_profiles):
+def build_summary(day, today, attempt, final, mode, state, errors, files, ran_profiles, clock=None):
     accs = {a["profile"]: a for a in day.get("accounts", [])}
     st_accs = state["accounts"]
     recharge, free, special, other = [], [], [], []
@@ -422,17 +580,16 @@ def build_summary(day, today, attempt, final, mode, state, errors, files, ran_pr
     for n, b in other:
         arr.append(f"{L(n)} +{b}")
     arr_txt = "，".join(arr)
-    t = now()
+    t = clock or now()
     if status == "ok":
         msg = f"今天的 Lovart 积分全部到账了：{arr_txt}，没有没到账的。"
     else:
         msg = "今天的 Lovart 积分" + (f"已到账：{arr_txt}。" if arr_txt else "还没有号到账。")
         if pending:
             nxt = next_check_label(t)
-            msg += f"{join_l(pending)} 还没到账（已查 {attempt} 次），" + (f"{nxt}再查。" if nxt else "稍后再查。")
+            msg += phrase_pending(pending, accs) + "，" + (f"{nxt}再查。" if nxt else "稍后再查。")
         if not_arrived:
-            bits = [f"{L(n)}（已连续 {st_accs[str(n)].get('consecutive_miss_days')} 天）" for n in not_arrived]
-            msg += f"{'、'.join(bits)}今天查了 {attempt} 次都没到账，记为今日未到账。"
+            msg += phrase_not_arrived(not_arrived, accs, st_accs) + "，记为今日未到账。"
         if conn:
             msg += f"{join_l(conn)} 连接出问题（网关假 IP / SSL 断开等），这轮没法判断，不算未到账" + ("，需要人工看一下。" if final else "，下一轮会再查。")
         if page_err:
@@ -461,6 +618,8 @@ def build_summary(day, today, attempt, final, mode, state, errors, files, ran_pr
         "status": status,
         "mode": mode,
         "attempt": attempt,
+        "attempt_per_account": {L(n): a.get("attempt") for n, a in sorted(accs.items())},
+        "attempt_note": "各号次数看 accounts[].attempt；attempt 与 pending_today.attempt_done 只是高水位，不是全员已查次数",
         "final": final,
         "checked_this_run": [L(n) for n in sorted(ran_profiles)],
         "recharge": [L(n) for n in recharge],
@@ -485,9 +644,15 @@ def build_summary(day, today, attempt, final, mode, state, errors, files, ran_pr
                    "login_required": len(login), "email_mismatch": len(mismatch)},
         "accounts": [{"account": L(n), "class": a.get("class_after"), "bonus": a.get("bonus"),
                       "claimed_time": a.get("claimed_time"),
-                      "balance": (st_accs.get(str(n), {}).get("balance")
-                                  if st_accs.get(str(n), {}).get("balance") is not None
-                                  else a.get("balance")),
+                      "balance": a.get("total_balance"),
+                      "balance_is_new_observation": a.get("total_balance") is not None,
+                      "balance_historical": (
+                          st_accs.get(str(n), {}).get("balance")
+                          if (a.get("total_balance") is None and a.get("balance") is None
+                              and st_accs.get(str(n), {}).get("balance_stale")
+                              and st_accs.get(str(n), {}).get("balance") is not None)
+                          else None
+                      ),
                       "plan": a.get("plan"), "status": a.get("status"), "attempt": a.get("attempt")}
                      for n, a in sorted(accs.items())],
         "message_zh": msg,
@@ -504,17 +669,28 @@ def write_zh_report(path, day, summary, state, active, mode):
     head = {"ok": "**全部到账**", "pending": "**有号未到账**", "error": "**有异常（需人工看）**"}[summary["status"]]
 
     def line(n, a):
-        # 余额用最终写入 state 的总额（与 class_changes 一并进日报）
+        # 只展示本轮可靠总额。旧 state.balance 若保留，标明是历史值。
         st = state["accounts"].get(str(n), {})
-        bal = st.get("balance") if st.get("balance") is not None else a.get("balance")
-        bal_s = str(bal) if bal is not None else f"未解析（顶栏 {a.get('topbar_lightning')}）"
+        bal = a.get("total_balance") if a.get("total_balance") is not None else a.get("balance")
+        if bal is not None:
+            bal_s = str(bal)
+        else:
+            reason = a.get("balance_unreliable_reason")
+            if reason in ("email_local_digits", "no_login", "renewal_day", "today_remaining_only"):
+                bal_s = "本轮无可靠总额"
+            else:
+                tb = a.get("topbar_lightning")
+                bal_s = f"未解析（顶栏 {tb}）" if tb is not None else "本轮无可靠总额"
+            hist = st.get("balance") if st.get("balance_stale") and st.get("balance") is not None else None
+            if hist is not None:
+                bal_s += f"（历史值 {hist}，非本轮读数）"
         s = f"- {L(n)} | +{a.get('bonus')} @ {a.get('claimed_time')} | 余额 {bal_s} | {a.get('plan')}"
         if a.get("renewal"):
             s += f" | 续费 {a['renewal']}"
         return s
 
     out = [f"## Lovart 每日登录积分检查报告 {day['date']}", ""]
-    out.append(f"- 检查时段：{day.get('started')} → {day.get('finished')}（Asia/Shanghai）；本轮第 {day.get('attempt')} 次（{mode}）" + ("，当天最后一轮" if summary["final"] else ""))
+    out.append(f"- 检查时段：{day.get('started')} → {day.get('finished')}（Asia/Shanghai）；{round_headline(day, summary, mode)}")
     out.append(f"- 活跃账号：{len(active)}（跳过弃用 {skipped}）")
     out.append(f"- 结果：{head} — +100×{b.get(100, 0)}，+70×{b.get(70, 0)}，未到账×{c.get('miss', 0)}，阻塞×{c.get('blocked', 0)}，需OTP×{c.get('needs_otp', 0)}")
     cc = "；".join(f"{x['account']} {x['from']}→{x['to']}（{x['reason']}）" for x in summary["class_changes"]) or "无"
@@ -606,12 +782,15 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--today")
     a = ap.parse_args()
-    if a.today and not a.dry_run:
-        ap.error("--today only allowed with --dry-run")
+    if a.today:
+        try:
+            datetime.date.fromisoformat(a.today)
+        except ValueError:
+            ap.error("--today must be YYYY-MM-DD")
     if a.force and not a.dry_run and not a.profiles:
         ap.error("--force without --profiles only allowed with --dry-run（指定 --profiles 时可实跑重扫）")
 
-    t0 = now()
+    t0 = wall_clock(a.dry_run)
     today = a.today or t0.strftime("%Y-%m-%d")
 
     if a.dry_run:
@@ -622,7 +801,10 @@ def main():
             shutil.copy2(a.state_src, state_path)
         log_path = os.path.join(out, "lovart-daily-credits-log.md")
         if not os.path.exists(log_path):
-            shutil.copy2(LOGMD, log_path)
+            if os.path.exists(LOGMD):
+                shutil.copy2(LOGMD, log_path)
+            else:
+                open(log_path, "w").close()
         base, sum_dir = out, out
     else:
         state_path, log_path, base, sum_dir = STATE, LOGMD, WS, AUTO
@@ -642,41 +824,51 @@ def main():
     active = sorted(int(k) for k, x in state["accounts"].items()
                     if not x.get("deprecated") and x.get("class") != "弃用" and int(k) not in HARD_SKIP)
 
-    force_profiles_only = bool(a.force and a.profiles and not a.dry_run)
+    # 有 --profiles 的 force（含 dry-run）只重扫这些号，不重置当天 first。
+    force_profiles_only = bool(a.force and a.profiles)
 
     if same_day and not pt.get("profiles") and not a.force:
         log(f"{today}: 当天已全部有结论（attempt_done={pt.get('attempt_done')}，pending 为空），直接退出")
         if not os.path.exists(files["summary"]) and os.path.exists(files["results"]):
             day = json.load(open(files["results"]))
-            s = build_summary(day, today, int(pt.get("attempt_done") or 1), True, "already-done", state, [], files, [])
+            s = build_summary(day, today, int(pt.get("attempt_done") or 1), True, "already-done", state, [], files, [], clock=t0)
             jdump(s, files["summary"])
             log("补写 summary:", files["summary"])
         print(json.dumps({"exit": "already_done", "date": today, "summary": files["summary"]}, ensure_ascii=False))
         return 0
 
+    if a.mode == "recheck" and not same_day:
+        # 没有该业务日的 first 时，不得升成 first / attempt=1 / 全员第一轮。
+        # 未传 --today 时业务日就是墙钟日：延迟到次日的 recheck 会走这里，不占用新日 first。
+        # 要归属原业务日，调用方显式传 --today；要开新日晨检，显式跑 first。
+        wall = t0.strftime("%Y-%m-%d")
+        msg = (
+            f"recheck 拒绝：业务日 {today} 还没有 first 记录，"
+            f"不会升成 first，也不会写成 attempt=1 的全员第一轮。"
+            f"墙钟日期 {wall}。"
+            f"延迟重查请传入 --today <原业务日>（该日须已有 first）；新的一天请显式运行 first。"
+        )
+        log(msg)
+        print(json.dumps({
+            "exit": "refused_recheck_without_first",
+            "date": today,
+            "wall_clock_date": wall,
+            "pending_today_date": pt.get("date"),
+            "error": msg,
+        }, ensure_ascii=False))
+        return 4
+
     if same_day and (not a.force or force_profiles_only):
-        # 指定号强制重扫：合并进当天 results，不重置 attempt=1 以免抹掉其它号
-        attempt = int(pt.get("attempt_done") or 1) + (1 if force_profiles_only or pt.get("profiles") else 0)
-        if force_profiles_only and not pt.get("profiles"):
-            attempt = int(pt.get("attempt_done") or 1) + 1
         targets = [n for n in pt.get("profiles", []) if n in active]
         effective_mode = "recheck"
         if force_profiles_only:
-            log(f"force+profiles：合并重扫指定号（不重置全天 first）")
+            log("force+profiles：合并重扫指定号（不重置全天 first），只给被查号自己的次数 +1")
     else:
-        attempt = 1
         targets = list(active)
         effective_mode = "first"
-        if a.mode == "recheck":
-            log("今天还没有第一轮记录 → 按第一轮查全部在用号")
     if a.profiles:
         only = {int(x) for x in a.profiles.split(",") if x.strip()}
         targets = [n for n in (active if (a.force or force_profiles_only) else targets) if n in only]
-    fh = os.environ.get("LOVART_AUTO_FAKE_HOUR") if a.dry_run else None  # test hook, dry-run only
-    final = is_final(attempt, t0.replace(hour=int(fh)) if fh else t0)
-    files["attempt"] = f"{base}/lovart-daily-credits-attempt{attempt}-{today}.json"
-    files["attempt_md"] = f"{base}/lovart-daily-credits-attempt{attempt}-{today}.md"
-    log(f"date={today} mode={a.mode}→{effective_mode} attempt={attempt} final={final} targets={targets} dry_run={a.dry_run}")
 
     # backups of formal files before touching anything
     if not a.dry_run:
@@ -690,14 +882,42 @@ def main():
     if effective_mode == "recheck" and os.path.exists(files["results"]):
         day = json.load(open(files["results"]))
     else:
-        day = {"date": today, "attempt": attempt, "started": iso(t0),
+        day = {"date": today, "attempt": 1, "started": iso(t0),
                "method": "cdp-puppeteer + classic-UI switch (lovart-auto/check-one.cjs) via Fork-2 / lovart-auto/switch-profile.sh; lovart-auto/run.sh (no model)",
                "note": "programmatic run (lovart-auto)", "accounts": [], "pending_retry": [], "class_changes": [],
                "new_deprecated": []}
+    day.setdefault("accounts", [])
     day.setdefault("class_changes", [])
     day.setdefault("new_deprecated", [])
+    attempt_of = {}
+    if effective_mode == "first":
+        for n in targets:
+            attempt_of[n] = 1
+    else:
+        prev_map = {}
+        for x in day.get("accounts") or []:
+            prof = x.get("profile")
+            prev_att = x.get("attempt")
+            if isinstance(prof, int) and isinstance(prev_att, int) and prev_att > 0:
+                prev_map[prof] = max(prev_map.get(prof, 0), prev_att)
+        for n in targets:
+            prev = prev_map.get(n) or 0
+            attempt_of[n] = (prev + 1) if prev else 1
+    # attempt 只作本轮文件名/高水位。各号次数在 attempt_of，不代表没查的号也到了这个次数。
+    attempt = max(attempt_of.values()) if attempt_of else 1
+    fh = os.environ.get("LOVART_AUTO_FAKE_HOUR") if a.dry_run else None  # test hook, dry-run only
+    clock = t0.replace(hour=int(fh), minute=0, second=0, microsecond=0) if fh else t0
+    # 单号 force 不用「该号自己的次数 >= 3」把整天收成最后一轮；整点规则仍看 FINAL_HOUR。
+    if force_profiles_only:
+        final = clock.hour >= FINAL_HOUR
+    else:
+        final = clock.hour >= FINAL_HOUR or (bool(attempt_of) and min(attempt_of.values()) >= MAX_ATTEMPTS)
+    files["attempt"] = f"{base}/lovart-daily-credits-attempt{attempt}-{today}.json"
+    files["attempt_md"] = f"{base}/lovart-daily-credits-attempt{attempt}-{today}.md"
+    log(f"date={today} mode={a.mode}→{effective_mode} attempt_high_water={attempt} per_account={attempt_of} final={final} targets={targets} dry_run={a.dry_run}")
     attempt_doc = {"date": today, "attempt": attempt, "started": iso(t0), "method": day.get("method"),
-                   "note": f"lovart-auto {effective_mode}", "accounts": [], "pending_retry": [], "class_changes": []}
+                   "note": f"lovart-auto {effective_mode}", "accounts": [], "pending_retry": [], "class_changes": [],
+                   "attempt_per_account": {str(n): attempt_of[n] for n in targets}}
     day["attempt"] = attempt
     day[f"attempt{attempt}_started"] = iso(t0)
 
@@ -714,7 +934,7 @@ def main():
             raw = dict(json.load(open(fake)).get(str(n)) or empty_raw("fake: no entry")) if fake else check_profile(chrome_n, email, today)
         except Exception as e:
             raw = empty_raw(f"runner exception: {e}")
-        rec = make_rec(n, email, prior, raw, attempt, iso(), note_special=acc.get("note_special"))
+        rec = make_rec(n, email, prior, raw, attempt_of[n], iso(), note_special=acc.get("note_special"))
         ran.append(n)
         if chrome_n != n:
             log(f"L{n} → Chrome Profile {chrome_n}")
@@ -725,39 +945,55 @@ def main():
             f.write(f"- P{n} | bonus={rec['bonus']} | time={rec['claimed_time']} | bal={rec['balance']} | plan={rec['plan']} | status={rec['status']} | class {rec['class_before']}→{rec['class_after']} | {rec['note']}\n")
 
         # ---- update state account
-        h = {"date": today, "bonus": rec["bonus"], "attempt": attempt, "note": rec["note"],
-             "balance": rec.get("total_balance") if rec.get("total_balance") is not None else rec["balance"],
+        prior_state_bal = acc.get("balance")
+        h = {"date": today, "bonus": rec["bonus"], "attempt": rec["attempt"], "note": rec["note"],
+             "balance": rec.get("total_balance"),
              "today_remaining": rec.get("today_remaining"),
              "total_balance": rec.get("total_balance"),
              "status": rec["status"], "claimed_time": rec["claimed_time"], "plan": rec["plan"],
              "renewal": rec["renewal"], "topbar_lightning": rec["topbar_lightning"]}
+        if rec.get("total_balance") is None and prior_state_bal is not None and not _is_poison_balance(
+                prior_state_bal, email_local_poison_numbers(email)):
+            h["balance_historical"] = prior_state_bal
+            h["balance_historical_note"] = "prior_state_not_this_round"
         if rec["status"] != "ok":
             h["last_bonus"] = rec["last_bonus"]
         if rec["status"] == "blocked":
             h["block_reason"] = rec["block_reason"]
         acc.setdefault("history", []).append(h)
+        # 余额观测与到账状态分开：可靠总额才写入；没有可靠总额则旧值只标成历史，不冒充本轮读数。
+        new_tot = rec.get("total_balance")
+        if new_tot is not None:
+            acc["balance"] = new_tot
+            acc["balance_stale"] = False
+            acc.pop("balance_stale_note", None)
+            rec["balance"] = new_tot
+        else:
+            rec["balance"] = None
+            poison = email_local_poison_numbers(email)
+            tb = rec.get("topbar_lightning")
+            today_rem = rec.get("today_remaining")
+            if (
+                isinstance(acc.get("balance"), (int, float))
+                and not isinstance(acc.get("balance"), bool)
+                and isinstance(tb, (int, float))
+                and not isinstance(tb, bool)
+                and acc.get("balance") == tb
+                and not _topbar_looks_real_total(tb, today_rem)
+            ):
+                acc["balance"] = None
+                rec["note"] = (rec.get("note") or "") + "; cleared_contaminated_balance"
+            if _is_poison_balance(acc.get("balance"), poison):
+                acc["balance"] = None
+                rec["note"] = (rec.get("note") or "") + "; cleared_email_local_balance"
+            if acc.get("balance") is not None:
+                acc["balance_stale"] = True
+                acc["balance_stale_note"] = "not_observed_this_round"
+            else:
+                acc["balance_stale"] = False
+                acc.pop("balance_stale_note", None)
         if rec["status"] == "ok":
             acc["consecutive_miss_days"] = 0
-            # 2026-10-30：按真实可用总额写入；禁止硬保留旧高余额 / 拒绝降级
-            # 只写可靠 total_balance，禁止用本日额度覆盖 state.balance
-            new_tot = rec.get("total_balance")
-            if new_tot is not None:
-                acc["balance"] = new_tot
-                # 同步 rec，供日报/summary 用最终写入 state 的总额
-                rec["balance"] = new_tot
-            else:
-                # 无可靠总额：若旧 balance 等于本轮毒顶栏（续费日误读），清掉污染
-                tb = rec.get("topbar_lightning")
-                today_rem = rec.get("today_remaining")
-                if (
-                    isinstance(acc.get("balance"), (int, float))
-                    and isinstance(tb, (int, float))
-                    and acc.get("balance") == tb
-                    and not _topbar_looks_real_total(tb, today_rem)
-                ):
-                    acc["balance"] = None
-                    rec["balance"] = None
-                    rec["note"] = (rec.get("note") or "") + "; cleared_contaminated_balance"
             if rec.get("today_remaining") is not None:
                 acc["today_remaining"] = rec["today_remaining"]
             if rec["class_after"] != prior:
@@ -783,10 +1019,10 @@ def main():
     day["accounts"].sort(key=lambda x: x["profile"])
     if final:
         for rec in day["accounts"]:
-            if rec.get("status") == "miss" and rec.get("attempt") == attempt and rec["profile"] in ran:
+            if rec.get("status") == "miss" and rec["profile"] in ran:
                 acc = state["accounts"][str(rec["profile"])]
                 acc["consecutive_miss_days"] = int(acc.get("consecutive_miss_days") or 0) + 1
-                acc["history"][-1]["note"] += f"; 今日未到账 (attempt {attempt}, consecutive {acc['consecutive_miss_days']})"
+                acc["history"][-1]["note"] += f"; 今日未到账 (attempt {rec.get('attempt')}, consecutive {acc['consecutive_miss_days']})"
                 if acc["consecutive_miss_days"] >= 3:
                     acc["deprecated"] = True
                     acc["class"] = "弃用"
@@ -797,7 +1033,7 @@ def main():
     retry_status = ("miss", "blocked", "needs_otp", "email_mismatch") if not final else ("blocked", "needs_otp", "email_mismatch")
     day["pending_retry"] = [x["profile"] for x in day["accounts"] if x.get("status") in ("miss", "blocked")]
     pending_profiles = [x["profile"] for x in day["accounts"] if x.get("status") in retry_status]
-    t1 = now()
+    t1 = wall_clock(a.dry_run)
     day["finished"] = iso(t1)
     day[f"attempt{attempt}_finished"] = iso(t1)
     attempt_doc["finished"] = iso(t1)
@@ -809,15 +1045,18 @@ def main():
             snap_path = write_balance_snapshot(today, state, day.get("accounts") or [], ran)
         except Exception as e:
             log(f"balance snapshot failed: {e}")
-    summary = build_summary(day, today, attempt, final, effective_mode, state, errors, files, ran)
+    summary = build_summary(day, today, attempt, final, effective_mode, state, errors, files, ran, clock=clock)
     if snap_path:
         summary["balance_snapshot"] = snap_path
 
     # ---- state.pending_today
+    attempts_present = [int(x["attempt"]) for x in day["accounts"] if isinstance(x.get("attempt"), int)]
+    high_water = max(attempts_present) if attempts_present else attempt
     newpt = dict(pt) if (same_day and pt.get("date") == today) else {}
     newpt.update({
         "date": today,
-        "attempt_done": attempt,
+        "attempt_done": high_water,
+        "attempt_done_note": "max per-account attempt, not a claim every account was checked this many times",
         "profiles": pending_profiles,
         "report_sent": False,
         "class_changes_so_far": day["class_changes"],
