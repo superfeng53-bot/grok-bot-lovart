@@ -8,6 +8,8 @@
 # 日志行缓冲：Go 的 supercronic 写到普通文件时不会按行刷出，只对它套 stdbuf 无效。
 # start 用 util-linux script(1) 分配 PTY，输出经 script -f 立刻进入 scheduler.log。
 # pidfile 里是 __loop 这个循环 bash 的 pid，不是 script 的 pid。
+# util-linux script -c 会经 sh -c 启动命令（2.41 上这层 sh 会留下来当父进程）。
+# start 用 exec env … bash，把 sh 替换掉，于是 __loop 的父进程就是 script。
 # 心跳和 cgroup 只做诊断，不改 crontab、开火方式或「退出后 10 秒再拉起」。
 # cgroup 写失败是预期（服务用户通常写不了 background/cgroup.procs），不代表冻结已修好。
 set -u
@@ -22,6 +24,42 @@ CGROUP_PROCS=/sys/fs/cgroup/background/cgroup.procs
 export TZ=Asia/Shanghai LANG=C.UTF-8 HOME=/home/box PATH=/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 running() { [[ -f $PIDF ]] && kill -0 "$(cat $PIDF)" 2>/dev/null; }
+
+# argv 必须正好是「$BIN -passthrough-logs $AUTO/crontab」这三项。
+# 不能用 pkill -f 的子串：生产 supervisor 的 bash -c 文本里就嵌着这串命令，
+# 测试副本若按 lovart-auto/crontab 去扫，会把生产循环一起杀掉。
+argv_is_this_supercronic() {
+  local pid=$1 n
+  local -a argv=()
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  mapfile -d '' argv <"/proc/$pid/cmdline" || true
+  n=${#argv[@]}
+  if (( n > 0 )) && [[ -z ${argv[n-1]} ]]; then
+    unset 'argv[n-1]'
+    n=$((n - 1))
+  fi
+  (( n == 3 )) || return 1
+  [[ ${argv[0]} == "$BIN" && ${argv[1]} == "-passthrough-logs" && ${argv[2]} == "$AUTO/crontab" ]]
+}
+
+each_exact_supercronic() {
+  local pid nullglob_was=0
+  shopt -q nullglob && nullglob_was=1
+  shopt -s nullglob
+  for pid in /proc/[0-9]*; do
+    pid=${pid##*/}
+    if argv_is_this_supercronic "$pid"; then
+      "$@" "$pid"
+    fi
+  done
+  (( nullglob_was == 1 )) || shopt -u nullglob
+}
+
+print_exact_supercronic() {
+  local pid=$1 line
+  line=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  printf '  %s %s\n' "$pid" "$line"
+}
 
 kill_stale_runs() {
   # 杀掉超过 90 分钟的 run.sh / lovart_auto.py，避免锁与 supercronic「仍在跑」跨天
@@ -60,8 +98,8 @@ stop_all() {
     kill -KILL "$loop" 2>/dev/null || true
     rm -f "$PIDF"
   fi
-  # 兜底：残留 supercronic
-  pkill -f 'supercronic.*lovart-auto/crontab' 2>/dev/null || true
+  # 兜底：只杀掉 argv 与本实例完全一致的残留 supercronic，不影响别的目录或 bash -c。
+  each_exact_supercronic kill -TERM --
   rm -f /tmp/lovart-auto.lock.pid /tmp/lovart-auto.lock.holder
 }
 
@@ -127,7 +165,7 @@ case "${1:-status}" in
     mkdir -p "$AUTO/logs"
     # -q 不在 stdout 写 Script started/done；-f 每次从 PTY 读到数据就 fflush 到日志。
     # typescript 丢到 /dev/null，日志只用 script 自己的 stdout，避免横幅和双写。
-    loop_cmd=$(printf 'LOVART_SCHEDULER_LOOP=1 bash %q __loop' "$0")
+    loop_cmd=$(printf 'exec env LOVART_SCHEDULER_LOOP=1 bash %q __loop' "$0")
     nohup setsid script -q -f -e -c "$loop_cmd" /dev/null >>"$LOG" 2>&1 </dev/null &
     sleep 1
     running && echo "started (loop pid $(cat $PIDF))" || { echo "FAILED to start, see $LOG"; exit 1; }
@@ -146,7 +184,8 @@ case "${1:-status}" in
     ;;
   status)
     if running; then
-      echo "running (loop pid $(cat $PIDF))"; pgrep -af "supercronic.*lovart-auto/crontab" | sed 's/^/  /'
+      echo "running (loop pid $(cat $PIDF))"
+      each_exact_supercronic print_exact_supercronic
       [[ -f /tmp/lovart-auto.lock.holder ]] && echo "lock holder: $(cat /tmp/lovart-auto.lock.holder) pid=$(cat /tmp/lovart-auto.lock.pid 2>/dev/null)"
     else echo "NOT running → run: $AUTO/scheduler.sh start"; fi
     ;;

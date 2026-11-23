@@ -30,8 +30,11 @@ assert_source() {
   grep -q -- '-passthrough-logs' "$SRC" || die "supercronic 仍应使用 -passthrough-logs"
   grep -q 'sleep 10' "$SRC" || die "supercronic 退出后仍应等待 10 秒"
   grep -q 'echo $$ > "$PIDF"' "$SRC" || die "pidfile 应写循环 bash 的 \$\$"
+  grep -q 'exec env LOVART_SCHEDULER_LOOP=1 bash' "$SRC" || die "start 应用 exec 去掉 script 外的 sh -c"
   # 注释里可以解释为什么不用 stdbuf；真正的命令行不能靠它。
   ! grep -vE '^[[:space:]]*#' "$SRC" | grep -q 'stdbuf' || die "不要用 stdbuf 冒充行缓冲"
+  ! grep -vE '^[[:space:]]*#' "$SRC" | grep -q 'pkill -f' || die "不要用 pkill -f 按子串杀进程"
+  ! grep -vE '^[[:space:]]*#' "$SRC" | grep -q 'supercronic\.\*' || die "不要留下 supercronic.* 这种宽匹配"
   ! grep -vE '^[[:space:]]*#' "$SRC" | grep -Eq 'systemd|0 9 \* \* \*' || die "scheduler.sh 不应加入 systemd 或 crontab 时刻"
 }
 
@@ -127,16 +130,20 @@ prepare_copy() {
   local dir=$1 heartbeat=$2 cgroup=$3
   cp "$SRC" "$dir/scheduler.sh"
   chmod +x "$dir/scheduler.sh"
+  # 目录名故意不含 lovart-auto，避免和旧的宽 pkill 或生产路径撞车。
+  [[ $dir != *lovart-auto* ]] || die "测试目录含有 lovart-auto: $dir"
   sed -i \
-    -e "s|^AUTO=.*|AUTO=$dir/lovart-auto|" \
+    -e "s|^AUTO=.*|AUTO=$dir/credit-sched|" \
     -e "s|^BIN=.*|BIN=$TMP/fake-supercronic|" \
     -e "s|^PIDF=.*|PIDF=$dir/scheduler.pid|" \
     -e "s|^HEARTBEAT_SEC=.*|HEARTBEAT_SEC=$heartbeat|" \
     -e "s|^CGROUP_PROCS=.*|CGROUP_PROCS=$cgroup|" \
     "$dir/scheduler.sh"
+  grep -qxF "AUTO=$dir/credit-sched" "$dir/scheduler.sh" || die "副本 AUTO 没改成测试目录"
   grep -qxF "PIDF=$dir/scheduler.pid" "$dir/scheduler.sh" || die "副本仍指向生产 pidfile"
   grep -qxF "BIN=$TMP/fake-supercronic" "$dir/scheduler.sh" || die "副本没指向假 supercronic"
   grep -qxF "CGROUP_PROCS=$cgroup" "$dir/scheduler.sh" || die "副本 cgroup 路径没改掉"
+  [[ $dir/credit-sched != *lovart-auto* && $dir/scheduler.pid != "$REAL_PIDF" ]] || die "副本路径和生产成本撞了"
 }
 
 negative_control() {
@@ -167,9 +174,10 @@ assert_pid_is_loop_bash() {
   ppid=$(ps -o ppid= -p "$lp" | tr -d ' ')
   [[ $ppid != "$lp" ]] || die "pidfile 不该是它自己的父进程"
   pcmd=$(ps -o args= -p "$ppid")
-  # script 的 -c 参数里会带上 __loop，但父进程本身必须是 script，不是循环 bash。
-  [[ $pcmd == script\ * || $pcmd == */script\ * ]] || die "父进程应是 script: $pcmd"
-  [[ $(ps -o comm= -p "$ppid" | tr -d ' ') == script ]] || die "pidfile 指到了 script 而不是循环 bash"
+  # exec 之后父进程应直接是 script。中间如果还剩 sh -c，把整条祖先进错误里。
+  if [[ $(ps -o comm= -p "$ppid" | tr -d ' ') != script ]]; then
+    die "父进程应是 script，实际: $pcmd"$'\n'"$(ancestor_chain "$lp")"
+  fi
   local child_cmd
   child_cmd=$(ps -o args= --ppid "$lp" | tr '\n' '|')
   [[ $child_cmd == *fake-supercronic* ]] || die "循环 bash 的子进程里没有假 supercronic: $child_cmd"
@@ -186,6 +194,48 @@ print("mtime delta %.3fs" % delta)
 PY
 }
 
+ancestor_chain() {
+  local p=$1 i=0 comm args
+  while [[ -n $p && $p != 0 && $p != 1 && $i -lt 6 ]]; do
+    comm=$(ps -o comm= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    args=$(ps -o args= -p "$p" 2>/dev/null || true)
+    printf '  pid=%s comm=%s args=%s\n' "$p" "$comm" "$args"
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    i=$((i + 1))
+  done
+}
+
+start_production_lookalikes() {
+  # 旧 pkill -f 'supercronic.*lovart-auto/crontab' 会命中这种 bash -c。
+  bash -c 'sleep 400; : /home/box/.local/bin/supercronic -passthrough-logs /workspace/lovart-auto/crontab' &
+  standin_supervisor_pid=$!
+  # ELF 才能保住 argv0。shebang 脚本会被内核改成解释器路径。
+  env -u FAKE_META bash -c 'exec -a /home/box/.local/bin/supercronic "$1" -passthrough-logs /workspace/lovart-auto/crontab' _ "$TMP/fake-supercronic" &
+  standin_super_pid=$!
+  sleep 0.3
+  kill -0 "$standin_supervisor_pid" || die "supervisor 替身没起来"
+  kill -0 "$standin_super_pid" || die "supercronic 替身没起来"
+  local sup_cmd sc
+  sup_cmd=$(tr '\0' ' ' <"/proc/$standin_supervisor_pid/cmdline")
+  [[ $sup_cmd == *'/home/box/.local/bin/supercronic -passthrough-logs /workspace/lovart-auto/crontab'* ]] \
+    || die "supervisor 替身不像生产命令行: $sup_cmd"
+  sc=$(python3 - "/proc/$standin_super_pid/cmdline" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read().split(b"\0")
+if data and data[-1] == b"":
+    data = data[:-1]
+print("\n".join(x.decode() for x in data))
+PY
+)
+  [[ $sc == $'/home/box/.local/bin/supercronic\n-passthrough-logs\n/workspace/lovart-auto/crontab' ]] \
+    || die "supercronic 替身 argv 不是生产那三项: $sc"
+}
+
+assert_lookalikes_alive() {
+  kill -0 "$standin_supervisor_pid" || die "stop 误伤了看起来像生产 supervisor 的 bash -c"
+  kill -0 "$standin_super_pid" || die "stop 误伤了看起来像生产 supercronic 的进程"
+}
+
 cleanup() {
   if [[ -n "${SCHED:-}" && -f ${SCHED:-} ]]; then
     "$SCHED" stop >/dev/null 2>&1 || true
@@ -199,6 +249,12 @@ cleanup() {
     fi
     rm -f "$PIDF"
   fi
+  if [[ -n ${standin_supervisor_pid:-} ]]; then
+    kill "$standin_supervisor_pid" 2>/dev/null || true
+  fi
+  if [[ -n ${standin_super_pid:-} ]]; then
+    kill "$standin_super_pid" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -208,6 +264,7 @@ assert_source
 TMP=$(mktemp -d)
 compile_fake "$TMP"
 negative_control "$TMP/fake-supercronic" "$TMP/negative.log"
+start_production_lookalikes
 
 # --- cgroup 写失败：进程仍要起来，日志只记预期失败 ---
 FAIL_DIR=$TMP/fail
@@ -215,7 +272,7 @@ mkdir -p "$FAIL_DIR"
 prepare_copy "$FAIL_DIR" 60 "$FAIL_DIR/missing-dir/cgroup.procs"
 SCHED=$FAIL_DIR/scheduler.sh
 PIDF=$FAIL_DIR/scheduler.pid
-LOG=$FAIL_DIR/lovart-auto/logs/scheduler.log
+LOG=$FAIL_DIR/credit-sched/logs/scheduler.log
 export FAKE_META=$FAIL_DIR/meta
 rm -f "$FAKE_META"
 "$SCHED" start >/dev/null
@@ -225,6 +282,7 @@ grep -q 'not a freeze fix' "$LOG" || die "失败日志不应让人以为冻结�
 kill -0 "$(loop_pid)" || die "cgroup 失败不应该让循环退出"
 "$SCHED" stop >/dev/null
 [[ ! -f $PIDF ]] || die "stop 后失败用例的 pidfile 还在"
+assert_lookalikes_alive
 
 # --- 行缓冲、pidfile、心跳、cgroup 成功、10 秒重启 ---
 OK_DIR=$TMP/ok
@@ -234,7 +292,7 @@ CG=$OK_DIR/cgroup.procs
 prepare_copy "$OK_DIR" 3 "$CG"
 SCHED=$OK_DIR/scheduler.sh
 PIDF=$OK_DIR/scheduler.pid
-LOG=$OK_DIR/lovart-auto/logs/scheduler.log
+LOG=$OK_DIR/credit-sched/logs/scheduler.log
 export FAKE_META=$OK_DIR/meta
 rm -f "$FAKE_META"
 # 直接跑 __loop 不能写 pidfile（即便外面碰巧是终端）。
@@ -242,6 +300,20 @@ direct_rc=0
 direct_out=$("$SCHED" __loop 2>&1) || direct_rc=$?
 [[ $direct_rc -eq 64 ]] || die "直接 __loop 应拒绝，退出码 $direct_rc，输出: $direct_out"
 [[ ! -f $PIDF ]] || die "直接 __loop 写了 pidfile"
+# 调度器还没启动时，stop 只能靠精确 argv 清理。生产样子的替身必须还在。
+env -u FAKE_META "$TMP/fake-supercronic" -passthrough-logs "$OK_DIR/credit-sched/crontab" &
+orphan=$!
+sleep 0.2
+kill -0 "$orphan" || die "本副本残留没起来"
+"$SCHED" stop >/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  kill -0 "$orphan" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$orphan" 2>/dev/null; then
+  die "stop 没有按精确 argv 清掉本副本的残留 supercronic"
+fi
+assert_lookalikes_alive
 start_out=$("$SCHED" start)
 [[ $start_out == started\ \(loop\ pid\ * ]] || die "start 输出异常: $start_out"
 wait_grep 'start supercronic' 3 || die "启动后日志里没有 start supercronic"
@@ -253,11 +325,13 @@ assert_mtime_fresh
 lp=$(loop_pid)
 [[ $start_out == *"loop pid $lp"* ]] || die "start 打印的 pid 与 pidfile 不一致"
 assert_pid_is_loop_bash
+echo "process tree:"
+ancestor_chain "$lp"
 [[ -f $FAKE_META ]] || die "假 supercronic 没写 meta"
 grep -q '^stdin_tty=false$' "$FAKE_META" || die "任务 stdin 不应是终端: $(cat "$FAKE_META")"
 grep -q '^stderr_tty=true$' "$FAKE_META" || die "supercronic stderr 应看到 PTY: $(cat "$FAKE_META")"
 grep -F -q -- '-passthrough-logs' "$FAKE_META" || die "没有按原样传入 -passthrough-logs"
-grep -F -q -- "$OK_DIR/lovart-auto/crontab" "$FAKE_META" || die "crontab 路径不对: $(cat "$FAKE_META")"
+grep -F -q -- "$OK_DIR/credit-sched/crontab" "$FAKE_META" || die "crontab 路径不对: $(cat "$FAKE_META")"
 grep -F -q "moved pid=$lp into $CG" "$LOG" || die "cgroup 成功没有记日志"
 grep -F -q 'not a freeze fix' "$LOG" || die "成功日志也不应宣称冻结已修好"
 grep -qx "$lp" "$CG" || die "cgroup.procs 里没有循环 pid"
@@ -326,6 +400,7 @@ stop_out=$("$SCHED" stop || true)
 ! kill -0 "$new" 2>/dev/null || die "stop 后循环还在"
 if proc_args_contain "$SCHED __loop"; then die "stop 后还有 __loop 或 script"; fi
 if proc_args_contain "$TMP/fake-supercronic"; then die "stop 后假 supercronic 还在"; fi
+assert_lookalikes_alive
 [[ ! -e $REAL_PIDF ]] || die "测试碰到了生产 pidfile"
 sha256sum "$CRONTAB" | awk '{print $1}' | grep -qx "$CRONTAB_SHA" || die "跑完后 crontab 变了"
 
